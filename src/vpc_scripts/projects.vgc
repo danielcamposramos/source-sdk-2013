@@ -90,6 +90,11 @@ $Project "qc_eyes"
 	"utils\qc_eyes\qc_eyes.vpc" [$WINDOWS]
 }
 
+$Project "sourcevr_display"
+{
+	"sourcevr_display\sourcevr_display.vpc" [$LINUXALL]
+}
+
 $Project "serverplugin_empty"
 {
 	"utils\serverplugin_sample\serverplugin_empty.vpc"

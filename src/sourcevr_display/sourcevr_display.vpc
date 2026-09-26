@@ -1,0 +1,41 @@
+//-----------------------------------------------------------------------------
+//	SOURCEVR_DISPLAY.VPC
+//
+//	The engine's VR module (sourcevr) for stereoscopic displays: 3D TVs,
+//	projectors and monitors, side by side. Linux for now: it reaches the
+//	game's SDL2 for the pointer and reads /proc for its own folder.
+//-----------------------------------------------------------------------------
+
+$Macro SRCDIR		".."
+$Macro OUTBINDIR	"$SRCDIR\..\game\bin"
+$Macro OUTBINNAME	"sourcevr"
+
+$Include "$SRCDIR\vpc_scripts\source_dll_base.vpc"
+
+$Configuration
+{
+	$Compiler
+	{
+		$AdditionalIncludeDirectories		"$BASE,$SRCDIR\public\sourcevr"
+	}
+}
+
+$Project "sourcevr_display"
+{
+	$Folder	"Source Files"
+	{
+		$File	"sourcevr_display.cpp"
+	}
+
+	$Folder	"Header Files"
+	{
+		$File	"$SRCDIR\public\sourcevr\isourcevirtualreality.h"
+		$File	"$SRCDIR\public\sourcevr\isourcevrdisplay.h"
+	}
+
+	$Folder	"Link Libraries"
+	{
+		$Lib mathlib
+		$Lib tier1
+	}
+}

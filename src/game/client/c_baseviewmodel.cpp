@@ -18,6 +18,7 @@
 #include "tools/bonelist.h"
 #include <KeyValues.h>
 #include "hltvcamera.h"
+#include "sourcevr/isourcevrdisplay.h"
 #ifdef TF_CLIENT_DLL
 	#include "c_tf_player.h"
 	#include "tf_weaponbase.h"
@@ -48,6 +49,12 @@ void PostToolMessage( HTOOLHANDLE hEntity, KeyValues *msg );
 
 void FormatViewModelAttachment( Vector &vOrigin, bool bInverse )
 {
+	// On a stereoscopic display the view model is drawn with each eye's own
+	// projection, so its attachments (the muzzle flash) already sit where the
+	// model is drawn; converting them from viewmodel_fov would move them off it.
+	if ( UseVRDisplay() )
+		return;
+
 	// Presumably, SetUpView has been called so we know our FOV and render origin.
 	const CViewSetup *pViewSetup = view->GetPlayerViewSetup();
 	
