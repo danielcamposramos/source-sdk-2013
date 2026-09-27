@@ -18,6 +18,13 @@
 //   7  checkerboard, from side by side for DLP screens: even pixels (x + y) the
 //                                      first eye, odd pixels the second
 //   8  checkerboard, from top and bottom
+//   9  rows, from full top and bottom          (1920x2160)
+//  10  checkerboard, from full side by side    (3840x1080)
+//  11  checkerboard, from full top and bottom  (1920x2160)
+// gamescope runs the effect on the game's buffer and then scales it to the
+// screen (with -S stretch), halving the doubled axis of a full format; 9-11
+// set each pair of buffer pixels that becomes one screen pixel to the same eye,
+// so the pattern survives the scaling (rows from full side by side are 6).
 // The rows and checkerboard pass each eye's colour through unchanged. They are
 // written to the formats' definitions and not yet seen on such a screen.
 // Techniques 0 and 1 are least-squares channel mixes (Eric Dubois's method, 2001) for red/
@@ -156,4 +163,28 @@ technique Checkerboard_SBS
 technique Checkerboard_TaB
 {
 	pass { VertexShader = PostProcessVS; PixelShader = PS_Checkerboard_TaB; SRGBWriteEnable = true; }
+}
+
+// Full formats: one screen pixel is two buffer pixels along the doubled axis.
+bool odd_row_full_tab(float4 pos) { return frac(floor(pos.y * 0.5) * 0.5) > 0.25; }
+bool odd_cell_full_sbs(float4 pos) { return frac((floor(pos.x * 0.5) + floor(pos.y)) * 0.5) > 0.25; }
+bool odd_cell_full_tab(float4 pos) { return frac((floor(pos.x) + floor(pos.y * 0.5)) * 0.5) > 0.25; }
+
+float4 PS_Rows_TaBFull(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return float4(eye_tab(uv, odd_row_full_tab(pos)), 1.0); }
+float4 PS_Checkerboard_SBSFull(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return float4(eye_sbs(uv, odd_cell_full_sbs(pos)), 1.0); }
+float4 PS_Checkerboard_TaBFull(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return float4(eye_tab(uv, odd_cell_full_tab(pos)), 1.0); }
+
+technique Rows_TaBFull
+{
+	pass { VertexShader = PostProcessVS; PixelShader = PS_Rows_TaBFull; SRGBWriteEnable = true; }
+}
+
+technique Checkerboard_SBSFull
+{
+	pass { VertexShader = PostProcessVS; PixelShader = PS_Checkerboard_SBSFull; SRGBWriteEnable = true; }
+}
+
+technique Checkerboard_TaBFull
+{
+	pass { VertexShader = PostProcessVS; PixelShader = PS_Checkerboard_TaBFull; SRGBWriteEnable = true; }
 }

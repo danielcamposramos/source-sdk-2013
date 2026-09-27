@@ -126,6 +126,7 @@ struct Config {
 	char onvr[512];   // console commands issued when VR starts
 	bool mouselog;    // diagnostics: log the system pointer next to the UI cursor
 	bool anglelog;    // diagnostics: view angles and time of every frame
+	bool confine;     // keep the system pointer on the UI's area when the window is bigger
 	FILE *log;
 };
 
@@ -348,6 +349,7 @@ void load_config()
 	g_cfg.dump = (int)env_double("SVRTV_DUMP", 0);
 	g_cfg.mouselog = env_double("SVRTV_MOUSELOG", 0) != 0;
 	g_cfg.anglelog = env_double("SVRTV_ANGLELOG", 0) != 0;
+	g_cfg.confine = env_double("SVRTV_CONFINE", 1) != 0;
 	g_cfg.latecopy = env_double("SVRTV_LATECOPY", 0) != 0;
 	g_cfg.dumpevery = (int)env_double("SVRTV_DUMPEVERY", 0);
 	g_cfg.eyew = g_cfg.eyeh = 0;
@@ -445,6 +447,7 @@ static ConVar vr_display_gamescope("vr_display_gamescope", "0", FCVAR_DONTRECORD
 static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
 	"1 when the game runs outside gamescope (set by the VR module)");
 
+
 class CSourceVRTelevision : public ISourceVirtualReality, public ISourceVRDisplay
 {
 public:
@@ -467,6 +470,11 @@ public:
 		m_sdlLooked = false;
 		m_sdlLib = NULL;
 		m_getKeyFocus = NULL;
+		m_setMouseRect = NULL;
+		m_warp = NULL;
+		m_triedMouseRect = false;
+		m_confined = NULL;
+		m_gsScreenW = m_gsScreenH = 0;
 		m_getState = NULL;
 		m_getFocus = NULL;
 		m_getSize = NULL;
@@ -478,10 +486,13 @@ public:
 		m_uiFull = false;
 		m_selfSet = false;
 		m_relayout = 0;
+		m_modeCheckFrame = 0;
 		m_applyQueued = false;
 		m_effectSet = false;
 		m_xTried = false;
 		m_xdpy = NULL;
+		m_xDefaultScreen = NULL;
+		m_xDisplayWidth = m_xDisplayHeight = NULL;
 		m_uiMade = false;
 		m_nTargets = 0;
 	}
@@ -942,6 +953,8 @@ public:
 	typedef int (*XChangePropertyFn)(void *, unsigned long, unsigned long, unsigned long, int, int, const unsigned char *, int);
 	typedef int (*XDeletePropertyFn)(void *, unsigned long, unsigned long);
 	typedef int (*XFlushFn)(void *);
+	typedef int (*XDefaultScreenFn)(void *);
+	typedef int (*XDisplaySizeFn)(void *, int);
 	bool in_gamescope() { return getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL; }
 	bool x11()
 	{
@@ -961,6 +974,9 @@ public:
 		m_xChange = (XChangePropertyFn)dlsym(lib, "XChangeProperty");
 		m_xDelete = (XDeletePropertyFn)dlsym(lib, "XDeleteProperty");
 		m_xFlush = (XFlushFn)dlsym(lib, "XFlush");
+		m_xDefaultScreen = (XDefaultScreenFn)dlsym(lib, "XDefaultScreen");
+		m_xDisplayWidth = (XDisplaySizeFn)dlsym(lib, "XDisplayWidth");
+		m_xDisplayHeight = (XDisplaySizeFn)dlsym(lib, "XDisplayHeight");
 		if (!open || !m_xInternAtom || !m_xRoot || !m_xChange || !m_xDelete || !m_xFlush)
 			return false;
 		m_xdpy = open(NULL);
@@ -1021,6 +1037,17 @@ public:
 		m_effectSet = technique >= 0;
 		logf("output: gamescope effect %s (technique %d)\n", technique < 0 ? "off" : "svrtv-anaglyph.fx", technique);
 	}
+	// Inside gamescope, which formats its nested screen can hold.
+	void publish_gamescope_screen()
+	{
+		if (!g_pCVar || !in_gamescope() || !x11() || !m_xDefaultScreen || !m_xDisplayWidth || !m_xDisplayHeight)
+			return;
+		int screen = m_xDefaultScreen(m_xdpy);
+		int sw = m_xDisplayWidth(m_xdpy, screen), sh = m_xDisplayHeight(m_xdpy, screen);
+		m_gsScreenW = sw;
+		m_gsScreenH = sh;
+		logf("gamescope screen at start: %dx%d\n", sw, sh);
+	}
 	void apply_output()
 	{
 		int out = g_cfg.output;
@@ -1034,10 +1061,19 @@ public:
 				gamescope_effect(-1);
 			return;
 		}
-		// svrtv-anaglyph.fx techniques, from side by side / from top and bottom:
-		// anaglyph CRT 0/3, anaglyph modern 1/4, rows 6/5, checkerboard 7/8.
-		static const int techniques[OUT_COUNT][2] = { { -1, -1 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
-		gamescope_effect(techniques[out][packed_tab() ? 1 : 0]);
+		// svrtv-anaglyph.fx techniques by packing: side by side, top and
+		// bottom, full side by side, full top and bottom. The full ones keep the
+		// rows and checkerboard whole through gamescope's 2:1 scaling (9-11).
+		static const int techniques[OUT_COUNT][4] = {
+			{ -1, -1, -1, -1 },   // the 3D display: no effect
+			{ 0, 3, 0, 3 },       // anaglyph, CRT
+			{ 1, 4, 1, 4 },       // anaglyph, modern screens
+			{ 6, 5, 6, 9 },       // rows
+			{ 7, 8, 10, 11 },     // checkerboard
+		};
+		int f = packing();
+		int column = f == FMT_SBS_FULL ? 2 : f == FMT_TAB_FULL ? 3 : packed_tab() ? 1 : 0;
+		gamescope_effect(techniques[out][column]);
 	}
 	void clear_output()
 	{
@@ -1096,6 +1132,23 @@ public:
 		int f = g_cfg.format;
 		return f == FMT_TAB_FULL || f == FMT_SBS_FULL || f == FMT_FP1080 || f == FMT_FP720;
 	}
+	// gamescope's nested screen is sized at its start (the 2D size); its
+	// root-window property GAMESCOPE_XWAYLAND_MODE_CONTROL = [server, width,
+	// height, allow bigger than the output] resizes it at run time (Steam's
+	// own gamescope session changes game resolutions this way). The full
+	// formats set it to the frame size first, so the game's mode is granted
+	// (run q18: without it the buffer stayed 1920x1080).
+	void gamescope_screen(int w, int h)
+	{
+		if (!in_gamescope() || !x11())
+			return;
+		unsigned long root = m_xRoot(m_xdpy);
+		unsigned long atom = m_xInternAtom(m_xdpy, "GAMESCOPE_XWAYLAND_MODE_CONTROL", 0);
+		long mode[4] = { 0, w, h, 1 };
+		m_xChange(m_xdpy, root, atom, 6 /* XA_CARDINAL */, 32, 0 /* PropModeReplace */, (const unsigned char *)mode, 4);
+		m_xFlush(m_xdpy);
+		logf("gamescope screen set to %dx%d\n", w, h);
+	}
 	void frame_mode_on()
 	{
 		int fw, fh, w, h;
@@ -1113,9 +1166,23 @@ public:
 				fclose(f);
 			}
 		}
+		gamescope_screen(fw, fh);
 		char cmd[96];
 		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", fw, fh, windowed ? 1 : 0);
 		command(cmd);
+		m_modeCheckFrame = m_frame + 60;
+	}
+	// A moment after asking for a frame-size mode, the back buffer says
+	// whether it was granted; logged only, so the run shows it as it is.
+	void check_frame_mode()
+	{
+		if (!m_modeCheckFrame || m_frame < m_modeCheckFrame || !material_system())
+			return;
+		m_modeCheckFrame = 0;
+		int fw, fh, bw, bh;
+		frame_size(&fw, &fh);
+		m_ms->GetBackBufferDimensions(bw, bh);
+		logf("frame mode %dx%d %s: back buffer %dx%d\n", fw, fh, (bw == fw && bh == fh) ? "granted" : "NOT granted", bw, bh);
 	}
 	void frame_mode_off()
 	{
@@ -1128,6 +1195,7 @@ public:
 		char cmd[96];
 		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", w, h, windowed);
 		command(cmd);
+		gamescope_screen(w, h);
 	}
 
 	// Anisotropic filtering 16x while 3D is on: slanted surfaces stay sharp
@@ -1232,6 +1300,79 @@ public:
 		if (!f && m_mouseLogs < 400)
 			logf("SDL: %s not found\n", name);
 		return f;
+	}
+
+	// The game's UI cursor uses window pixels 1:1 and the UI is laid out at
+	// the 2D size, so when the window is bigger than the UI (the full formats,
+	// or a gamescope screen bigger than the game) the cursor can walk off what
+	// the eyes show (mouse log, 2026-09-24: the cursor left the 640x480 sheet
+	// down to y 819; run q20: the menu out of reach in a 3840x2160 gamescope
+	// screen). Confine the system pointer to the UI's area then, through the
+	// game's own SDL2. Established solution 2 (README).
+	struct SdlRect { int x, y, w, h; };
+	typedef int (*SdlSetMouseRect)(void *, const SdlRect *);
+	typedef void (*SdlWarp)(void *, int, int);
+	void *sdl_window()
+	{
+		if (!m_getFocus)
+			m_getFocus = (SdlGetFocus)sdl("SDL_GetMouseFocus");
+		if (!m_getKeyFocus)
+			m_getKeyFocus = (SdlGetFocus)sdl("SDL_GetKeyboardFocus");
+		void *w = m_getFocus ? m_getFocus() : NULL;
+		if (!w && m_getKeyFocus)
+			w = m_getKeyFocus();
+		return w;
+	}
+	bool needs_fence()
+	{
+		// Never inside gamescope: its relative mouse pins a fenced pointer
+		// (runs q15/q16, and again q20). Established solution.
+		if (in_gamescope())
+			return false;
+		int fw, fh;
+		frame_size(&fw, &fh);
+		int W = g_cfg.width, H = g_cfg.height;
+		return fw > W || fh > H;
+	}
+	void confine_mouse(bool on)
+	{
+		if (!g_cfg.confine)
+			return;
+		if (on && !needs_fence())
+			on = false;
+		if (!on && !m_confined)
+			return;
+		if (!m_setMouseRect && !m_triedMouseRect) {
+			m_triedMouseRect = true;
+			m_setMouseRect = (SdlSetMouseRect)sdl("SDL_SetWindowMouseRect");
+			m_warp = (SdlWarp)sdl("SDL_WarpMouseInWindow");
+			if (!m_getState)
+				m_getState = (SdlGetMouseState)sdl("SDL_GetMouseState");
+			if (!m_getRel)
+				m_getRel = (SdlGetRelative)sdl("SDL_GetRelativeMouseMode");
+		}
+		void *win = sdl_window();
+		if (!win)
+			return;
+		int W = g_cfg.width, H = g_cfg.height;
+		if (m_setMouseRect) {
+			if (on && win == m_confined)
+				return;
+			SdlRect rc = { 0, 0, W, H };
+			int rv = m_setMouseRect(win, on ? &rc : NULL);
+			m_confined = on ? win : NULL;
+			logf("mouse %s to %dx%d (SDL_SetWindowMouseRect: %d)\n", on ? "confined" : "released", W, H, rv);
+			return;
+		}
+		// Older SDL: pull the pointer back each frame while the cursor is
+		// free (menus); relative mode (play) needs nothing.
+		m_confined = on ? win : NULL;
+		if (on && m_warp && m_getState && !(m_getRel && m_getRel())) {
+			int x, y;
+			m_getState(&x, &y);
+			if (x > W - 1 || y > H - 1)
+				m_warp(win, x > W - 1 ? W - 1 : x, y > H - 1 ? H - 1 : y);
+		}
 	}
 
 	// Diagnostics: the system pointer (SDL, window pixels) next to the game's
@@ -1362,8 +1503,11 @@ public:
 			log_mouse();
 		if (g_cfg.anglelog)
 			record_angles();
-		if (m_active)
+		if (m_active) {
+			confine_mouse(true);
 			ui_full_size();
+			check_frame_mode();
+		}
 		m_shown[0] = m_shown[1] = false;
 		m_hudCopied = false;
 		// The client passes 0 while the view has the game's default field of
@@ -1592,6 +1736,7 @@ public:
 		m_active = false;
 		logf("deactivated\n");
 		m_uiFull = false;
+		confine_mouse(false);
 		clear_output();
 		frame_mode_off();
 		crosshair_restore();
@@ -1619,6 +1764,7 @@ public:
 		// the first call, at startup: the client asks again from its own
 		// Activate(), after the module has marked 3D on (run q05).
 		if (!m_startupDone) {
+			publish_gamescope_screen();
 			launch_3d_unmark();
 			if (g_pCVar) {
 				g_cfg.output = vr_display_output.GetInt();
@@ -1712,6 +1858,10 @@ private:
 	XChangePropertyFn m_xChange;
 	XDeletePropertyFn m_xDelete;
 	XFlushFn m_xFlush;
+	XDefaultScreenFn m_xDefaultScreen;
+	XDisplaySizeFn m_xDisplayWidth;
+	XDisplaySizeFn m_xDisplayHeight;
+	int m_modeCheckFrame;       // the frame at which to log whether the frame mode was granted (0: none)
 	int m_relayout;             // Apply while on: the format + 1 to activate again with, in Deactivate()
 	ITexture *m_rt[2];
 	bool m_shown[2];
@@ -1729,6 +1879,11 @@ private:
 	bool m_sdlLooked;
 	void *m_sdlLib;
 	SdlGetFocus m_getKeyFocus;
+	SdlSetMouseRect m_setMouseRect;
+	SdlWarp m_warp;
+	bool m_triedMouseRect;
+	void *m_confined;
+	int m_gsScreenW, m_gsScreenH;   // gamescope's nested screen (0: not in gamescope)
 	SdlGetMouseState m_getState;
 	SdlGetFocus m_getFocus;
 	SdlGetWindowSize m_getSize;

@@ -2,7 +2,9 @@
 
 A VR module (`sourcevr.so`) that presents a stereoscopic display (a 3D TV, a projector, any screen with anaglyph glasses) to the engine as its headset. Source games from the 2013 SteamVR era still carry Valve's VR render path; with this module the engine itself renders both eyes, with real stereo geometry, into one frame the display unpacks. No per-game shader fixes, no wrapper around the renderer.
 
-Status: work in progress, being prepared as a pull request to Valve. This branch is the version played on a 3D TV (module `5db63a08`, rebuilt byte-identically by `build32-hl2.sh`). Where it fails is listed below, plainly; we are already chasing those fixes. The story, measurements and dated test runs are in [sony-bravia-linux](https://github.com/danielcamposramos/sony-bravia-linux/tree/main/tools/vr-stereo-spectator); the reports to Valve are [Source-1-Games#8297](https://github.com/ValveSoftware/Source-1-Games/issues/8297) and [SteamVR-for-Linux#961](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/961).
+**This branch (`stereo3d-full-res-wip`) is the fix being chased, not the version to play.** It adds the full-resolution formats inside gamescope: the module resizes gamescope's nested screen at run time through gamescope's own `GAMESCOPE_XWAYLAND_MODE_CONTROL` property, the pointer fence comes back for windows larger than the UI (never inside gamescope), and the effect gains row and checkerboard variants for the full formats (techniques 9 to 11). Known regression, run q21 (2026-09-26, module `18814471`): inside gamescope the mouse is pinned to the centre of the screen, even in the half formats; turning 3D off frees it. The q17 build on `stereo3d-sbs-native` does not have it; we are isolating the cause against that build. The full formats themselves have not been validated here yet. To play, use [`stereo3d-sbs-native`](https://github.com/danielcamposramos/source-sdk-2013/tree/stereo3d-sbs-native/src/sourcevr_display).
+
+Status: work in progress, being prepared as a pull request to Valve. The branch `stereo3d-sbs-native` is the version played on a 3D TV (module `5db63a08`, rebuilt byte-identically by `build32-hl2.sh`). Where it fails is listed below, plainly; we are already chasing those fixes. The story, measurements and dated test runs are in [sony-bravia-linux](https://github.com/danielcamposramos/sony-bravia-linux/tree/main/tools/vr-stereo-spectator); the reports to Valve are [Source-1-Games#8297](https://github.com/ValveSoftware/Source-1-Games/issues/8297) and [SteamVR-for-Linux#961](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/961).
 
 ## What works
 
@@ -36,7 +38,7 @@ cd source-sdk-2013/src/sourcevr_display
 ./build32-hl2.sh "$HOME/.steam/steam/steamapps/common/Half-Life 2/bin" out
 ```
 
-Use your own library path for `Half-Life 2/bin`. The script builds in Valve's Steam Runtime SDK image and prints the module's SHA-256; this branch gives `5db63a08…`.
+Use your own library path for `Half-Life 2/bin`. The script builds in Valve's Steam Runtime SDK image and prints the module's SHA-256; `stereo3d-sbs-native` gives `5db63a08…`, the played build.
 
 ### 2. Install it
 
