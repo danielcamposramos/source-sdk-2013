@@ -92,7 +92,7 @@ $Project "qc_eyes"
 
 $Project "sourcevr_display"
 {
-	"sourcevr_display\sourcevr_display.vpc" [$LINUXALL]
+	"sourcevr_display\sourcevr_display.vpc"
 }
 
 $Project "serverplugin_empty"

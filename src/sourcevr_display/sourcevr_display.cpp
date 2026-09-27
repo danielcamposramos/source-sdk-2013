@@ -60,6 +60,9 @@
 #include "sourcevr/isourcevrdisplay.h"
 #include "vgui/IInput.h"
 #include "vgui/ISurface.h"
+#ifdef _WIN32
+#include "winlite.h"
+#else
 #include <dlfcn.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -72,6 +75,7 @@ __asm__(".symver dlopen,dlopen@GLIBC_2.2.5");
 #else
 __asm__(".symver dlsym,dlsym@GLIBC_2.0");
 __asm__(".symver dlopen,dlopen@GLIBC_2.1");
+#endif
 #endif
 
 namespace {
@@ -137,6 +141,18 @@ char g_ini[32][2][128];
 int g_nini;
 char g_dir[1024];   // this module's directory, with the trailing slash
 
+#ifdef _WIN32
+// This module's own path, from the loader.
+bool module_path(char *out, size_t size)
+{
+	HMODULE self = NULL;
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)&module_path, &self))
+		return false;
+	DWORD n = GetModuleFileNameA(self, out, (DWORD)size);
+	return n > 0 && n < size;
+}
+#else
 // Hex without strtoul/sscanf, which current glibc redirects to its
 // C23 variants (GLIBC_2.38) under _GNU_SOURCE.
 uintptr_t parse_hex(const char **c)
@@ -180,6 +196,7 @@ bool module_path(char *out, size_t size)
 	fclose(m);
 	return found;
 }
+#endif
 
 // GamepadUI (the menu of Steam Deck and Big Picture, or -gamepadui) lays
 // its menus out in the window's real pixels and ignores the client's 640x480
@@ -205,6 +222,11 @@ void load_ini()
 	if (!module_path(path, sizeof(path)))
 		return;
 	char *slash = strrchr(path, '/');
+#ifdef _WIN32
+	char *backslash = strrchr(path, '\\');
+	if (backslash && (!slash || backslash > slash))
+		slash = backslash;
+#endif
 	if (!slash)
 		return;
 	slash[1] = 0;
@@ -301,10 +323,19 @@ static void write_angles()
 	g_nang = 0;
 }
 
+#ifdef _WIN32
+// MSVC has no destructor attribute: a static object's destructor runs at
+// the same point, when the module is unloaded or the game exits.
+struct AngleLogAtExit
+{
+	~AngleLogAtExit() { write_angles(); }
+} g_angleLogAtExit;
+#else
 __attribute__((destructor)) static void write_angles_at_exit()
 {
 	write_angles();
 }
+#endif
 
 void load_config()
 {
@@ -392,7 +423,11 @@ void load_config()
 	const char *lp = setting("SVRTV_LOG");
 	if (lp && *lp) {
 		char full[1200];
+#ifdef _WIN32
+		snprintf(full, sizeof(full), "%s%s", (lp[0] == '/' || lp[0] == '\\' || (lp[0] && lp[1] == ':')) ? "" : g_dir, lp);
+#else
 		snprintf(full, sizeof(full), "%s%s", lp[0] == '/' ? "" : g_dir, lp);
+#endif
 		g_cfg.log = fopen(full, "a");
 		// An absolute path outside what the container shares cannot be
 		// opened; log next to the module instead.
@@ -812,10 +847,16 @@ public:
 			write_angles();
 		QAngle a;
 		e->GetViewAngles(a);
+#ifdef _WIN32
+		// tier0's high-resolution clock; the log only uses differences.
+		AngleRow &r = g_ang[g_nang++];
+		r.t = Plat_FloatTime();
+#else
 		struct timeval tv;
 		gettimeofday(&tv, NULL);
 		AngleRow &r = g_ang[g_nang++];
 		r.t = tv.tv_sec + tv.tv_usec / 1e6;
+#endif
 		r.yaw = a[YAW];
 		r.pitch = a[PITCH];
 		r.frame = m_frame;
@@ -878,6 +919,13 @@ public:
 			fclose(f);   // already off, the player's value already kept
 		} else {
 			int was = 1;
+#ifdef _WIN32
+			// Windows keeps the video settings outside the game folder, so
+			// the live value is read before it is turned off.
+			ConVarRef blur("mat_motion_blur_enabled");
+			if (blur.IsValid())
+				was = blur.GetBool() ? 1 : 0;
+#else
 			char vc[1200], line[256];
 			snprintf(vc, sizeof(vc), "%s../hl2/videoconfig_linux.cfg", g_dir);
 			FILE *v = fopen(vc, "r");
@@ -892,6 +940,7 @@ public:
 				}
 				fclose(v);
 			}
+#endif
 			f = fopen(p, "w");
 			if (f) {
 				fprintf(f, "%d\n", was);
@@ -967,9 +1016,19 @@ public:
 	typedef int (*XChangePropertyFn)(void *, unsigned long, unsigned long, unsigned long, int, int, const unsigned char *, int);
 	typedef int (*XDeletePropertyFn)(void *, unsigned long, unsigned long);
 	typedef int (*XFlushFn)(void *);
+#ifdef _WIN32
+	// gamescope is Linux's (SteamOS's) compositor. A Windows game under
+	// Proton inside gamescope cannot reach its X display from here, so the
+	// Windows module offers the native menu only.
+	bool in_gamescope() { return false; }
+#else
 	bool in_gamescope() { return getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL; }
+#endif
 	bool x11()
 	{
+#ifdef _WIN32
+		return false;
+#else
 		if (m_xdpy)
 			return true;
 		if (m_xTried)
@@ -991,11 +1050,13 @@ public:
 		m_xdpy = open(NULL);
 		logf("output: X display %s\n", m_xdpy ? "open" : "not open");
 		return m_xdpy != NULL;
+#endif
 	}
 	// gamescope finds effects in its ReShade folder; the module brings its
 	// own copy from next to itself.
 	void install_effect()
 	{
+#ifndef _WIN32
 		const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
 		char dir[1100], src[1200], dst[1200];
 		if (xdg && *xdg)
@@ -1025,6 +1086,7 @@ public:
 			fclose(out);
 		}
 		fclose(in);
+#endif
 	}
 	void gamescope_effect(int technique)
 	{
@@ -1269,9 +1331,15 @@ public:
 	{
 		// The launcher loads SDL privately, so look it up by name in the
 		// already-loaded library, never loading a second copy.
+#ifdef _WIN32
+		if (!m_sdlLib)
+			m_sdlLib = (void *)GetModuleHandleA("SDL2.dll");
+		void *f = m_sdlLib ? (void *)GetProcAddress((HMODULE)m_sdlLib, name) : NULL;
+#else
 		if (!m_sdlLib)
 			m_sdlLib = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_NOLOAD);
 		void *f = m_sdlLib ? dlsym(m_sdlLib, name) : dlsym(RTLD_DEFAULT, name);
+#endif
 		if (!f && m_mouseLogs < 400)
 			logf("SDL: %s not found\n", name);
 		return f;
@@ -1884,7 +1952,11 @@ static ConCommand vr_display_apply("vr_display_apply", display_apply,
 
 // The Source interface factory, as tier1's EXPOSE_SINGLE_INTERFACE would
 // export it, without linking tier1.
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
 extern "C" __attribute__((visibility("default")))
+#endif
 void *CreateInterface(const char *name, int *returnCode)
 {
 	static bool configured = false;

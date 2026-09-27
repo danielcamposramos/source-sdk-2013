@@ -25,6 +25,7 @@ Played on a Sony KDL-46HX855 over HDMI, Half-Life 2 (native Linux, Vulkan), NVID
 - The OpenGL renderer crashes in VR mode (reported in #8297); use `-vulkan`.
 - Half-Life 2's shipped client is 32-bit and cannot be rebuilt from this SDK, so the client fixes in this branch (muzzle-flash position, menu size, HUD overlay) reach 64-bit SDK games only (tested on Half-Life 2: Deathmatch through Source SDK Base 2013 Multiplayer). On Half-Life 2 the muzzle flash needs the workaround below.
 - Multiplayer: the 64-bit launcher loads the module only with `-vr`, and the engine warns that an unsigned `sourcevr` module blocks secure servers.
+- Windows: the module is ported (2026-09-27) but not yet built with Microsoft's compiler, nor run. Its own code compiles against real Windows headers (MinGW syntax check: 0 errors in `sourcevr_display.cpp`; Valve's `tier0` headers need MSVC, as always on Windows), and the Linux build is unchanged, byte for byte (`5db63a08`). Next: build it in Visual Studio, try it under Proton, then on Windows itself. The gamescope outputs stay Linux only, as gamescope is; on Windows the menu offers the native formats.
 
 ## How to make it work (Half-Life 2 on Linux)
 
@@ -88,6 +89,10 @@ DXVK_CONFIG_FILE="/path/to/Half-Life 2/dxvk.conf" SDL_VIDEODRIVER=x11 gamescope-
 ```
 
 The module installs its anaglyph effect into gamescope's ReShade folder when needed and switches it from the menu. On our machine (desktop on an AMD iGPU, game on the NVIDIA card) the game also needed `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only` and gamescope `--prefer-vk-device 10de:2504`; a single-GPU machine should not need them. Our exact working launch is [play.env.example](https://github.com/danielcamposramos/sony-bravia-linux/blob/main/tools/hl2-bench/play.env.example), read by our Steam wrapper [game-wrap.sh](https://github.com/danielcamposramos/sony-bravia-linux/blob/main/tools/hl2-bench/game-wrap.sh).
+
+### Windows (ported, not built yet)
+
+Valve's route: run `createallprojects.bat` in `src`, open the generated `everything.sln` in Visual Studio 2022 (the SDK's README lists the workload and Windows SDK), build the `sourcevr_display` project, and copy `sourcevr.dll` and `svrtv-anaglyph.fx` into the game's `bin` folder, keeping Valve's `sourcevr.dll` as `sourcevr.dll.valve`. Which Half-Life 2 binary folder takes it on Windows (32 or 64-bit) is still to be checked there. The menu section and the launch options are the same as on Linux; the gamescope section does not apply.
 
 ### Back to stock
 
