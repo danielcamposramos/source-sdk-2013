@@ -2,8 +2,8 @@
 //	SOURCEVR_DISPLAY.VPC
 //
 //	The engine's VR module (sourcevr) for stereoscopic displays: 3D TVs,
-//	projectors and monitors, side by side. Linux for now: it reaches the
-//	game's SDL2 for the pointer and reads /proc for its own folder.
+//	projectors and monitors. Linux and Windows; the gamescope outputs
+//	(anaglyph, rows, checkerboard) are Linux only, as gamescope is.
 //-----------------------------------------------------------------------------
 
 $Macro SRCDIR		".."
