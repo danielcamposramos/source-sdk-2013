@@ -15,6 +15,7 @@
 #include "VGuiMatSurface/IMatSystemSurface.h"
 #include "vgui_controls/Controls.h"
 #include "sourcevr/isourcevirtualreality.h"
+#include "sourcevr/isourcevrdisplay.h"
 #include "ienginevgui.h"
 #include "cdll_client_int.h"
 #include "vgui/IVGui.h"
@@ -252,6 +253,8 @@ CClientVirtualReality::CClientVirtualReality()
 	
 	m_bOverrideTorsoAngle = false;
 	m_OverrideTorsoOffset.Init();
+	m_bChangedVideoMode = false;
+	m_bDisplay = false;
 
 	// Also reset our model of the player's torso orientation
 	m_PlayerTorsoAngle.Init ( 0.0f, 0.0f, 0.0f );
@@ -1047,6 +1050,11 @@ void CClientVirtualReality::CancelTorsoTransformOverride()
 
 bool CClientVirtualReality::CanOverlayHudQuad()
 {
+	// A stereoscopic display shows the HUD as in 2D, composited on the screen
+	// plane by the VR module; the floating in-world panel is a headset's.
+	if ( m_bDisplay && UseVRDisplay() )
+		return true;
+
 	bool bCanOverlay = true;
 
 	bCanOverlay = bCanOverlay && vr_render_hud_in_world.GetBool();
@@ -1401,7 +1409,15 @@ void CClientVirtualReality::Activate()
 
 	// remember where we were
 	m_bNonVRWindowed = g_pMaterialSystem->GetCurrentConfigForVideoCard().Windowed();
-	vgui::surface()->GetScreenSize( m_nNonVRWidth, m_nNonVRHeight );
+	// The window's own size, from the video mode. The UI's screen size can
+	// already be the VR viewport when VR mode is forced at startup (a top and
+	// bottom eye, 1920x540), and restoring that on Deactivate() left the 2D UI
+	// low-res.
+	const MaterialVideoMode_t &videoMode = g_pMaterialSystem->GetCurrentConfigForVideoCard().m_VideoMode;
+	m_nNonVRWidth = videoMode.m_Width;
+	m_nNonVRHeight = videoMode.m_Height;
+	if ( m_nNonVRWidth <= 0 || m_nNonVRHeight <= 0 )
+		vgui::surface()->GetScreenSize( m_nNonVRWidth, m_nNonVRHeight );
 #if defined( USE_SDL )
     static ConVarRef sdl_displayindex( "sdl_displayindex" );
     m_nNonVRSDLDisplayIndex = sdl_displayindex.GetInt();
@@ -1432,7 +1448,15 @@ void CClientVirtualReality::Activate()
 	mat_vsync.SetValue( 0 );
 #endif
 
-	g_pMatSystemSurface->ForceScreenSizeOverride(true, 640, 480 );
+	// A headset shows the UI on a small floating panel, laid out at 640x480. A
+	// stereoscopic display shows it as in 2D, laid out at the window's own size
+	// (the crosshair and the cursor then need no remapping; without an
+	// override the UI took the eye's viewport, 1920x540 in top and bottom).
+	m_bDisplay = UseVRDisplay();
+	if ( m_bDisplay )
+		g_pMatSystemSurface->ForceScreenSizeOverride( true, m_nNonVRWidth, m_nNonVRHeight );
+	else
+		g_pMatSystemSurface->ForceScreenSizeOverride(true, 640, 480 );
 	int nViewportWidth, nViewportHeight;
 
 	g_pSourceVR->GetViewportBounds( ISourceVirtualReality::VREye_Left, NULL, NULL, &nViewportWidth, &nViewportHeight );
@@ -1451,6 +1475,7 @@ void CClientVirtualReality::Activate()
 			char szCmd[256];
 			Q_snprintf( szCmd, sizeof(szCmd), "mat_setvideomode %i %i %i\n", rect.nWidth, rect.nHeight, vr_force_windowed.GetBool() ? 1 : 0 );
 			engine->ClientCmd_Unrestricted( szCmd );
+			m_bChangedVideoMode = true;
 		}
 	}
 }
@@ -1501,8 +1526,15 @@ void CClientVirtualReality::Deactivate()
 
 	// set mode
 	char szCmd[ 256 ];
-	Q_snprintf( szCmd, sizeof( szCmd ), "mat_setvideomode %i %i %i\n", m_nNonVRWidth, m_nNonVRHeight, m_bNonVRWindowed ? 1 : 0 );
-	engine->ClientCmd_Unrestricted( szCmd );
+	// Only undo a mode change Activate() made. When VR was forced it set none,
+	// and a same-size mode set here only resets the device (on Vulkan through
+	// DXVK that reset once crashed switching 3D off inside gamescope).
+	if ( m_bChangedVideoMode )
+	{
+		Q_snprintf( szCmd, sizeof( szCmd ), "mat_setvideomode %i %i %i\n", m_nNonVRWidth, m_nNonVRHeight, m_bNonVRWindowed ? 1 : 0 );
+		engine->ClientCmd_Unrestricted( szCmd );
+		m_bChangedVideoMode = false;
+	}
 
 }
 

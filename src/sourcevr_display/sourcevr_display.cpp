@@ -31,9 +31,12 @@
 //                      to this module when the game exits (diagnostics)
 //
 // In the game, 3D is switched on by any of: -stereo3d on the command line (a
-// launch option), the console setting vr_display_3d 1 (saved; the video
-// options can bind it), or SVRTV_LAYOUT. vr_display_3d also turns 3D on and
-// off while the game runs.
+// launch option, in the saved format; -stereo3d tab|sbs forces one), the saved settings the
+// video options bind (vr_display_3d 0/1, vr_display_layout 0 side by side /
+// 1 top and bottom, vr_display_output 0 the 3D display / 1 anaglyph for CRTs
+// / 2 anaglyph for modern screens, applied together on Apply), or
+// SVRTV_LAYOUT. Inside gamescope the anaglyph outputs switch gamescope's own
+// effect at run time; outside it they fall back to the 3D display.
 //
 // Builds for 32-bit (today's native HL2) and 64-bit Source games alike.
 
@@ -49,6 +52,7 @@
 #include "materialsystem/itexture.h"
 #include "materialsystem/imaterial.h"
 #include "materialsystem/imaterialvar.h"
+#include "materialsystem/materialsystem_config.h"
 #include "cdll_int.h"
 #include "tier1/tier1.h"
 #include "tier1/convar.h"
@@ -58,6 +62,7 @@
 #include "vgui/ISurface.h"
 #include <dlfcn.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 // dlsym under its original symbol version, which every glibc still exports;
 // the default one (GLIBC_2.34) is newer than Steam's runtimes.
@@ -71,9 +76,36 @@ __asm__(".symver dlopen,dlopen@GLIBC_2.1");
 
 namespace {
 
+// 3D formats: how the two eyes are packed into the frame. The values are the
+// ones vr_display_layout saves, so the order is fixed.
+enum Format {
+	FMT_SBS = 0,       // side by side, each eye half the width
+	FMT_TAB,           // top and bottom, each eye half the height (the default)
+	FMT_TAB_FULL,      // top and bottom, each eye the full 2D size
+	FMT_SBS_FULL,      // side by side, each eye the full 2D size
+	FMT_FP1080,        // HDMI 1.4 frame packing, 1920x2205 (a 45-line gap)
+	FMT_FP720,         // HDMI 1.4 frame packing, 1280x1470 (a 30-line gap)
+	FMT_COUNT
+};
+static const char *g_formatNames[FMT_COUNT] = { "sbs", "tab", "tabfull", "sbsfull", "fp1080", "fp720" };
+int format_from_name(const char *name)
+{
+	for (int i = 0; name && i < FMT_COUNT; i++)
+		if (!strcmp(name, g_formatNames[i]))
+			return i;
+	return -1;
+}
+
+// 3D outputs: what the screen needs. The ones past OUT_DISPLAY combine the
+// eyes pixel by pixel, which gamescope's effect does.
+enum Output { OUT_DISPLAY = 0, OUT_ANAGLYPH_CRT, OUT_ANAGLYPH_MODERN, OUT_ROWS, OUT_CHECKERBOARD, OUT_COUNT };
+
 struct Config {
 	bool enabled;   // 3D requested (SVRTV_LAYOUT set); otherwise fully inert
-	bool tab;
+	bool layoutGiven; // the format came with the request (SVRTV_LAYOUT, -stereo3d <format>)
+	int format;       // Format
+	int output;       // Output
+	bool sizeGiven;   // SVRTV_WIDTH/HEIGHT set; otherwise the 2D size is the video mode's
 	int width, height;
 	double aspect;
 	double separation;
@@ -94,7 +126,6 @@ struct Config {
 	char onvr[512];   // console commands issued when VR starts
 	bool mouselog;    // diagnostics: log the system pointer next to the UI cursor
 	bool anglelog;    // diagnostics: view angles and time of every frame
-	bool confine;     // keep the system pointer on the UI sheet while VR is on
 	FILE *log;
 };
 
@@ -279,10 +310,27 @@ void load_config()
 	load_ini();
 	const char *layout = setting("SVRTV_LAYOUT");
 	g_cfg.enabled = layout && *layout;
-	// The launch option, e.g. Steam's "3D SBS Vulkan": -vulkan -stereo3d.
-	if (CommandLine()->CheckParm("-stereo3d"))
+	g_cfg.format = FMT_TAB;
+	g_cfg.layoutGiven = false;
+	if (g_cfg.enabled && format_from_name(layout) >= 0) {
+		g_cfg.format = format_from_name(layout);
+		g_cfg.layoutGiven = true;
+	}
+	g_cfg.output = OUT_DISPLAY;
+	// The launch option, e.g. Steam's "3D SBS Vulkan": -vulkan -stereo3d, in
+	// the saved format (read at startup); -stereo3d <format> forces one
+	// (sbs, tab, tabfull, sbsfull, fp1080, fp720).
+	const char *layout3d = NULL;
+	if (CommandLine()->CheckParm("-stereo3d", &layout3d)) {
 		g_cfg.enabled = true;
-	g_cfg.tab = layout && !strcmp(layout, "tab");
+		if (format_from_name(layout3d) >= 0) {
+			g_cfg.format = format_from_name(layout3d);
+			g_cfg.layoutGiven = true;
+		}
+	}
+	// The 2D size: the game's own video mode (read when 3D starts), unless
+	// the bench gives one.
+	g_cfg.sizeGiven = setting("SVRTV_WIDTH") && setting("SVRTV_HEIGHT");
 	g_cfg.width = (int)env_double("SVRTV_WIDTH", 1920);
 	g_cfg.height = (int)env_double("SVRTV_HEIGHT", 1080);
 	g_cfg.aspect = env_double("SVRTV_ASPECT", (double)g_cfg.width / g_cfg.height);
@@ -302,11 +350,6 @@ void load_config()
 	g_cfg.anglelog = env_double("SVRTV_ANGLELOG", 0) != 0;
 	g_cfg.latecopy = env_double("SVRTV_LATECOPY", 0) != 0;
 	g_cfg.dumpevery = (int)env_double("SVRTV_DUMPEVERY", 0);
-	// Inside gamescope the fence pins the pointer to the sheet's bottom-right
-	// corner, in play and in the menus (Daniel, 2026-09-25, runs p15/p16), so
-	// it is on by default only outside gamescope, which sets
-	// GAMESCOPE_WAYLAND_DISPLAY for the games it starts.
-	g_cfg.confine = env_double("SVRTV_CONFINE", getenv("GAMESCOPE_WAYLAND_DISPLAY") ? 0 : 1) != 0;
 	g_cfg.eyew = g_cfg.eyeh = 0;
 	const char *ov = setting("SVRTV_ONVR");
 	// A television has no head tracking: the view follows the game (mode 7,
@@ -328,11 +371,10 @@ void load_config()
 			g_cfg.eyeh = h;
 		}
 	}
-	// Two crosshair modes. At full eye resolution the client's own crosshair
-	// lands off-centre (it is painted for a 640x480 screen), so the module
-	// draws HL2's crosshair on the 2D layer, once per eye. With 640x480 eyes
-	// (SVRTV_EYE=640x480) the client's own crosshair is centred and is kept.
-	g_cfg.xhair = env_double("SVRTV_CROSSHAIR", g_cfg.eyew == 0 ? 1 : 0) != 0;
+	// The client's own crosshair is painted for a 640x480 screen and lands
+	// off-centre in the eyes, so the module draws HL2's crosshair on the 2D
+	// layer, once per eye (SVRTV_CROSSHAIR=0 leaves the client's).
+	g_cfg.xhair = env_double("SVRTV_CROSSHAIR", 1) != 0;
 	// Source keeps motion blur's previous view in statics shared by both eyes
 	// (viewpostprocess.cpp), so in stereo each eye blurs differently during a
 	// turn; with it on, the mouse felt wrecked (Daniel, run p20, 2026-09-26).
@@ -359,9 +401,9 @@ void load_config()
 	}
 	if (g_cfg.convergence <= 0)
 		g_cfg.convergence = 120.0;
-	logf("config (%d lines from svrtv.ini): enabled=%d layout=%s %dx%d aspect=%.4f separation=%.3f convergence=%.1f swap=%d confine=%d\n",
-	     g_nini, (int)g_cfg.enabled, g_cfg.tab ? "tab" : "sbs", g_cfg.width, g_cfg.height, g_cfg.aspect,
-	     g_cfg.separation, g_cfg.convergence, (int)g_cfg.swap, (int)g_cfg.confine);
+	logf("config (%d lines from svrtv.ini): enabled=%d layout=%s %dx%d aspect=%.4f separation=%.3f convergence=%.1f swap=%d\n",
+	     g_nini, (int)g_cfg.enabled, g_formatNames[g_cfg.format], g_cfg.width, g_cfg.height, g_cfg.aspect,
+	     g_cfg.separation, g_cfg.convergence, (int)g_cfg.swap);
 }
 
 // +1 for the left eye, -1 for the right eye. The cameras never swap;
@@ -378,12 +420,30 @@ void set_identity(VMatrix &m)
 			m.m[i][j] = (i == j) ? 1.0f : 0.0f;
 }
 
-static void display_3d_changed(IConVar *var, const char *oldValue, float oldFloat);
+static void display_changed(IConVar *var, const char *oldValue, float oldFloat);
 
-// Saved with the player's settings, so the video options can offer a 3D
-// switch that applies at the next start and, here, at once.
+// Saved with the player's settings. The video options bind them and apply
+// them together on Apply; so does the console.
 static ConVar vr_display_3d("vr_display_3d", "0", FCVAR_ARCHIVE,
-	"Stereo 3D on a 3D display (side by side; engage the display's own 3D mode)", display_3d_changed);
+	"Stereo 3D on a 3D display: 0 disabled, 1 enabled (engage the display's own 3D mode)",
+	true, 0, true, 1, display_changed);
+// Top and bottom by default: each eye keeps the full width, the axis stereo
+// depth lives on (Daniel's choice, 2026-09-26).
+static ConVar vr_display_layout("vr_display_layout", "1", FCVAR_ARCHIVE,
+	"3D format: 1 top and bottom (recommended), 0 side by side, 2 top and bottom full, 3 side by side full, 4 frame packing 1080p, 5 frame packing 720p",
+	true, 0, true, FMT_COUNT - 1, display_changed);
+static ConVar vr_display_output("vr_display_output", "0", FCVAR_ARCHIVE,
+	"3D output: 0 the 3D display, 1 red/cyan anaglyph for CRTs, 2 red/cyan anaglyph for modern screens, 3 row-interleaved (passive screens), 4 checkerboard (DLP)",
+	true, 0, true, OUT_COUNT - 1, display_changed);
+static ConVar vr_display_swap("vr_display_swap", "0", FCVAR_ARCHIVE,
+	"Swap the eyes: 0 left eye first, 1 right eye first",
+	true, 0, true, 1, display_changed);
+// Whether the game runs inside gamescope, for the video options: some outputs
+// exist only there. Set by the module at start, not saved.
+static ConVar vr_display_gamescope("vr_display_gamescope", "0", FCVAR_DONTRECORD,
+	"1 when the game runs inside gamescope (set by the VR module)");
+static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
+	"1 when the game runs outside gamescope (set by the VR module)");
 
 class CSourceVRTelevision : public ISourceVirtualReality, public ISourceVRDisplay
 {
@@ -407,10 +467,6 @@ public:
 		m_sdlLooked = false;
 		m_sdlLib = NULL;
 		m_getKeyFocus = NULL;
-		m_setMouseRect = NULL;
-		m_warp = NULL;
-		m_triedMouseRect = false;
-		m_confined = NULL;
 		m_getState = NULL;
 		m_getFocus = NULL;
 		m_getSize = NULL;
@@ -420,7 +476,14 @@ public:
 		m_startupDone = false;
 		m_switchOff = false;
 		m_uiFull = false;
-		m_unmarking = false;
+		m_selfSet = false;
+		m_relayout = 0;
+		m_applyQueued = false;
+		m_effectSet = false;
+		m_xTried = false;
+		m_xdpy = NULL;
+		m_uiMade = false;
+		m_nTargets = 0;
 	}
 
 	// IAppSystem
@@ -432,6 +495,9 @@ public:
 		m_factory = factory;
 		ConnectTier1Libraries(&factory, 1);
 		ConVar_Register(0);
+		bool gamescope = getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL;
+		vr_display_gamescope.SetValue(gamescope ? 1 : 0);
+		vr_display_native.SetValue(gamescope ? 0 : 1);
 		return true;
 	}
 	void Disconnect()
@@ -448,10 +514,12 @@ public:
 		return NULL;
 	}
 
-	// ISourceVRDisplay: the client asks this before its display-only fixes
-	// (the muzzle flash placement).
-	bool IsDisplayActive() { return g_cfg.enabled && m_active; }
-	EOutput GetOutput() { return OUTPUT_SIDE_BY_SIDE; }
+	// ISourceVRDisplay: the client asks this before its display-only
+	// behaviour (the UI at the window's size, the HUD on the screen plane, the
+	// muzzle flash placement). The display is the headset whenever 3D is on:
+	// the spectator mode (a real headset, the display mirroring it) will
+	// answer false here, so the headset keeps its own UI and HUD.
+	bool IsDisplayTheHeadset() { return g_cfg.enabled && m_active; }
 	InitReturnVal_t Init() { return INIT_OK; }
 	void Shutdown() {}
 
@@ -496,21 +564,45 @@ public:
 			half(eye, NULL, NULL, w, h);
 	}
 
-	// Where an eye goes in the output frame.
+	// The format the frame is packed in. The pixel outputs (anaglyph, rows,
+	// checkerboard) only carry the eyes to gamescope, so frame packing, which
+	// needs the HDMI 3D signal, travels as full top and bottom there.
+	int packing()
+	{
+		if (g_cfg.output != OUT_DISPLAY && (g_cfg.format == FMT_FP1080 || g_cfg.format == FMT_FP720))
+			return FMT_TAB_FULL;
+		return g_cfg.format;
+	}
+	bool packed_tab() { int f = packing(); return f == FMT_TAB || f == FMT_TAB_FULL; }
+
+	// The output frame's size.
+	void frame_size(int *w, int *h)
+	{
+		int W = g_cfg.width, H = g_cfg.height;
+		switch (packing()) {
+		case FMT_TAB_FULL: *w = W; *h = 2 * H; break;
+		case FMT_SBS_FULL: *w = 2 * W; *h = H; break;
+		case FMT_FP1080: *w = 1920; *h = 2205; break;
+		case FMT_FP720: *w = 1280; *h = 1470; break;
+		default: *w = W; *h = H; break;
+		}
+	}
+
+	// Where an eye goes in the output frame. The left eye takes the first
+	// place (left, or top), as HDMI 1.4 packs them; frame packing leaves its
+	// gap (active space) between the eyes.
 	void half(VREye eye, int *x, int *y, int *w, int *h)
 	{
 		bool first = (eye == VREye_Left) != g_cfg.swap;
-		int vx, vy, vw, vh;
-		if (g_cfg.tab) {
-			vx = 0;
-			vw = g_cfg.width;
-			vh = g_cfg.height / 2;
-			vy = first ? 0 : g_cfg.height / 2;
-		} else {
-			vy = 0;
-			vh = g_cfg.height;
-			vw = g_cfg.width / 2;
-			vx = first ? 0 : g_cfg.width / 2;
+		int W = g_cfg.width, H = g_cfg.height;
+		int vx = 0, vy = 0, vw = W, vh = H;
+		switch (packing()) {
+		case FMT_SBS: vw = W / 2; vx = first ? 0 : W / 2; break;
+		case FMT_TAB: vh = H / 2; vy = first ? 0 : H / 2; break;
+		case FMT_TAB_FULL: vy = first ? 0 : H; break;
+		case FMT_SBS_FULL: vx = first ? 0 : W; break;
+		case FMT_FP1080: vw = 1920; vh = 1080; vy = first ? 0 : 1125; break;
+		case FMT_FP720: vw = 1280; vh = 720; vy = first ? 0 : 750; break;
 		}
 		if (x) *x = vx;
 		if (y) *y = vy;
@@ -644,7 +736,9 @@ public:
 			ctx->PopRenderTargetAndViewport();
 			return true;
 		}
-		ctx->PushRenderTargetAndViewport(NULL, 0, 0, g_cfg.width, g_cfg.height);
+		int fw, fh;
+		frame_size(&fw, &fh);
+		ctx->PushRenderTargetAndViewport(NULL, 0, 0, fw, fh);
 		int w = x1 - x0, h = y1 - y0;
 		// The client passes translucent = false while the mouse cursor is
 		// visible: a menu or dialog is open. Those keep HL2's layout (moving
@@ -782,42 +876,268 @@ public:
 		}
 		command("mat_motion_blur_enabled 0");
 	}
-	// Anisotropic filtering 16x while 3D is on: slanted surfaces stay sharp
-	// in both eyes (Daniel, 2026-09-25). The player's own value is kept in a
-	// marker next to the module and put back when 3D stops, or at the next
-	// start if the game quit in 3D, like the crosshair and motion blur.
-	// The video options show vr_display_3d, so while 3D is on it reads 1
-	// whatever turned it on (the menu showed "Disabled" in a -stereo3d
-	// session, Daniel, 2026-09-26). When -stereo3d or the bench turned it on,
-	// a marker says so, and the saved value goes back to 0 when 3D stops or
-	// at the next start: the launch option applies to its own launch.
+	// The video options show the settings, so while 3D is on they read what
+	// is showing whatever turned it on (the menu showed "Disabled" in a
+	// -stereo3d session, Daniel, 2026-09-26). When -stereo3d or the bench
+	// turned it on, a marker keeps the player's own values, which go back
+	// when 3D stops or at the next start: the launch option applies to its
+	// own launch.
 	void launch_3d_mark()
 	{
-		if (vr_display_3d.GetBool())
+		if (!g_pCVar)   // not connected to the engine (a test harness)
+			return;
+		int layout = g_cfg.format;
+		if (vr_display_3d.GetInt() == 1 && vr_display_layout.GetInt() == layout)
 			return;
 		char p[1200];
 		snprintf(p, sizeof(p), "%ssvrtv-launch-3d", g_dir);
-		FILE *f = fopen(p, "w");
-		if (f)
+		FILE *f = fopen(p, "r");
+		if (f) {
+			fclose(f);   // already marked: the player's first values are kept
+		} else if ((f = fopen(p, "w")) != NULL) {
+			fprintf(f, "%d %d\n", vr_display_3d.GetInt(), vr_display_layout.GetInt());
 			fclose(f);
+		}
+		m_selfSet = true;
 		vr_display_3d.SetValue(1);
+		vr_display_layout.SetValue(layout);
+		m_selfSet = false;
+	}
+	// The player changed the settings: from now on the values are theirs.
+	void launch_3d_forget()
+	{
+		char p[1200];
+		snprintf(p, sizeof(p), "%ssvrtv-launch-3d", g_dir);
+		remove(p);
 	}
 	void launch_3d_unmark()
 	{
+		if (!g_pCVar)
+			return;
 		char p[1200];
 		snprintf(p, sizeof(p), "%ssvrtv-launch-3d", g_dir);
 		FILE *f = fopen(p, "r");
 		if (!f)
 			return;
+		int was3d = 0, wasLayout = 0;
+		if (fscanf(f, "%d %d", &was3d, &wasLayout) != 2)
+			was3d = wasLayout = 0;
 		fclose(f);
 		remove(p);
-		m_unmarking = true;
-		vr_display_3d.SetValue(0);
-		m_unmarking = false;
+		m_selfSet = true;
+		vr_display_3d.SetValue(was3d);
+		vr_display_layout.SetValue(wasLayout);
+		m_selfSet = false;
 	}
 
+	// Anaglyph through gamescope: gamescope reads its ReShade effect and
+	// technique from two properties on the root window of the game's X
+	// display (GAMESCOPE_RESHADE_EFFECT, GAMESCOPE_RESHADE_TECHNIQUE_IDX), so
+	// the game switches it while running. libX11 is the game's own, loaded
+	// at run time. Techniques of svrtv-anaglyph.fx: 0 CRT and 1 modern
+	// screens from side by side, 3 and 4 the same from top and bottom.
+	typedef void *(*XOpenDisplayFn)(const char *);
+	typedef unsigned long (*XInternAtomFn)(void *, const char *, int);
+	typedef unsigned long (*XDefaultRootWindowFn)(void *);
+	typedef int (*XChangePropertyFn)(void *, unsigned long, unsigned long, unsigned long, int, int, const unsigned char *, int);
+	typedef int (*XDeletePropertyFn)(void *, unsigned long, unsigned long);
+	typedef int (*XFlushFn)(void *);
+	bool in_gamescope() { return getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL; }
+	bool x11()
+	{
+		if (m_xdpy)
+			return true;
+		if (m_xTried)
+			return false;
+		m_xTried = true;
+		void *lib = dlopen("libX11.so.6", RTLD_NOW);
+		if (!lib) {
+			logf("output: libX11 not found\n");
+			return false;
+		}
+		XOpenDisplayFn open = (XOpenDisplayFn)dlsym(lib, "XOpenDisplay");
+		m_xInternAtom = (XInternAtomFn)dlsym(lib, "XInternAtom");
+		m_xRoot = (XDefaultRootWindowFn)dlsym(lib, "XDefaultRootWindow");
+		m_xChange = (XChangePropertyFn)dlsym(lib, "XChangeProperty");
+		m_xDelete = (XDeletePropertyFn)dlsym(lib, "XDeleteProperty");
+		m_xFlush = (XFlushFn)dlsym(lib, "XFlush");
+		if (!open || !m_xInternAtom || !m_xRoot || !m_xChange || !m_xDelete || !m_xFlush)
+			return false;
+		m_xdpy = open(NULL);
+		logf("output: X display %s\n", m_xdpy ? "open" : "not open");
+		return m_xdpy != NULL;
+	}
+	// gamescope finds effects in its ReShade folder; the module brings its
+	// own copy from next to itself.
+	void install_effect()
+	{
+		const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+		char dir[1100], src[1200], dst[1200];
+		if (xdg && *xdg)
+			snprintf(dir, sizeof(dir), "%s/gamescope/reshade/Shaders", xdg);
+		else if (home && *home)
+			snprintf(dir, sizeof(dir), "%s/.local/share/gamescope/reshade/Shaders", home);
+		else
+			return;
+		for (char *c = dir + 1; *c; c++)
+			if (*c == '/') {
+				*c = 0;
+				mkdir(dir, 0755);
+				*c = '/';
+			}
+		mkdir(dir, 0755);
+		snprintf(src, sizeof(src), "%ssvrtv-anaglyph.fx", g_dir);
+		snprintf(dst, sizeof(dst), "%s/svrtv-anaglyph.fx", dir);
+		FILE *in = fopen(src, "rb");
+		if (!in)
+			return;
+		FILE *out = fopen(dst, "wb");
+		if (out) {
+			char buf[4096];
+			size_t n;
+			while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+				fwrite(buf, 1, n, out);
+			fclose(out);
+		}
+		fclose(in);
+	}
+	void gamescope_effect(int technique)
+	{
+		if (!x11())
+			return;
+		unsigned long root = m_xRoot(m_xdpy);
+		unsigned long effect = m_xInternAtom(m_xdpy, "GAMESCOPE_RESHADE_EFFECT", 0);
+		unsigned long index = m_xInternAtom(m_xdpy, "GAMESCOPE_RESHADE_TECHNIQUE_IDX", 0);
+		if (technique < 0) {
+			m_xDelete(m_xdpy, root, effect);
+		} else {
+			install_effect();
+			long idx = technique;
+			const char *name = "svrtv-anaglyph.fx";
+			m_xChange(m_xdpy, root, index, 6 /* XA_CARDINAL */, 32, 0 /* PropModeReplace */, (const unsigned char *)&idx, 1);
+			m_xChange(m_xdpy, root, effect, 31 /* XA_STRING */, 8, 0, (const unsigned char *)name, (int)strlen(name));
+		}
+		m_xFlush(m_xdpy);
+		m_effectSet = technique >= 0;
+		logf("output: gamescope effect %s (technique %d)\n", technique < 0 ? "off" : "svrtv-anaglyph.fx", technique);
+	}
+	void apply_output()
+	{
+		int out = g_cfg.output;
+		if (!in_gamescope()) {
+			if (out != OUT_DISPLAY)
+				command("echo \"3D output: this output needs gamescope; showing the 3D display format instead\"");
+			return;
+		}
+		if (out == 0) {
+			if (m_effectSet)
+				gamescope_effect(-1);
+			return;
+		}
+		// svrtv-anaglyph.fx techniques, from side by side / from top and bottom:
+		// anaglyph CRT 0/3, anaglyph modern 1/4, rows 6/5, checkerboard 7/8.
+		static const int techniques[OUT_COUNT][2] = { { -1, -1 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
+		gamescope_effect(techniques[out][packed_tab() ? 1 : 0]);
+	}
+	void clear_output()
+	{
+		if (m_effectSet)
+			gamescope_effect(-1);
+	}
+
+	// The full formats and frame packing need a video mode of the frame's
+	// size (3840x1080, 1920x2160, 1920x2205, 1280x1470). The module sets it
+	// when 3D starts and puts the player's own back when 3D stops; a marker
+	// keeps it if the game quits in 3D, or the frame size would be saved as
+	// the player's resolution.
+	IMaterialSystem *material_system()
+	{
+		if (!m_ms && m_factory)
+			m_ms = (IMaterialSystem *)m_factory(MATERIAL_SYSTEM_INTERFACE_VERSION_OLD, NULL);
+		return m_ms;
+	}
+	bool mode_now(int *w, int *h, bool *windowed)
+	{
+		IMaterialSystem *ms = material_system();
+		if (!ms)
+			return false;
+		const MaterialSystem_Config_t &cfg = ms->GetCurrentConfigForVideoCard();
+		*w = cfg.m_VideoMode.m_Width;
+		*h = cfg.m_VideoMode.m_Height;
+		*windowed = cfg.Windowed();
+		return *w > 0 && *h > 0;
+	}
+	bool saved_mode(int *w, int *h, int *windowed)
+	{
+		char p[1200];
+		snprintf(p, sizeof(p), "%ssvrtv-restore-mode", g_dir);
+		FILE *f = fopen(p, "r");
+		if (!f)
+			return false;
+		bool ok = fscanf(f, "%d %d %d", w, h, windowed) == 3;
+		fclose(f);
+		return ok && *w > 0 && *h > 0;
+	}
+	// The 2D size is the player's own video mode (the one kept in the marker
+	// while a frame-size mode is set).
+	void size_from_mode()
+	{
+		if (g_cfg.sizeGiven)
+			return;
+		int w, h, win;
+		bool windowed;
+		if (saved_mode(&w, &h, &win) || mode_now(&w, &h, &windowed)) {
+			g_cfg.width = w;
+			g_cfg.height = h;
+		}
+	}
+	bool needs_frame_mode()
+	{
+		int f = g_cfg.format;
+		return f == FMT_TAB_FULL || f == FMT_SBS_FULL || f == FMT_FP1080 || f == FMT_FP720;
+	}
+	void frame_mode_on()
+	{
+		int fw, fh, w, h;
+		bool windowed;
+		frame_size(&fw, &fh);
+		if (!mode_now(&w, &h, &windowed) || (w == fw && h == fh))
+			return;
+		int sw, sh, swin;
+		if (!saved_mode(&sw, &sh, &swin)) {
+			char p[1200];
+			snprintf(p, sizeof(p), "%ssvrtv-restore-mode", g_dir);
+			FILE *f = fopen(p, "w");
+			if (f) {
+				fprintf(f, "%d %d %d\n", w, h, windowed ? 1 : 0);
+				fclose(f);
+			}
+		}
+		char cmd[96];
+		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", fw, fh, windowed ? 1 : 0);
+		command(cmd);
+	}
+	void frame_mode_off()
+	{
+		int w, h, windowed;
+		if (!saved_mode(&w, &h, &windowed))
+			return;
+		char p[1200];
+		snprintf(p, sizeof(p), "%ssvrtv-restore-mode", g_dir);
+		remove(p);
+		char cmd[96];
+		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", w, h, windowed);
+		command(cmd);
+	}
+
+	// Anisotropic filtering 16x while 3D is on: slanted surfaces stay sharp
+	// in both eyes (Daniel, 2026-09-25). The player's own value is kept in a
+	// marker next to the module and put back when 3D stops, or at the next
+	// start if the game quit in 3D, like the crosshair and motion blur.
 	void set_for_3d(const char *name, int value)
 	{
+		if (!g_pCVar)   // not connected to the engine (a test harness)
+			return;
 		char p[1200];
 		snprintf(p, sizeof(p), "%ssvrtv-restore-%s", g_dir, name);
 		FILE *f = fopen(p, "r");
@@ -914,63 +1234,8 @@ public:
 		return f;
 	}
 
-	// The game's UI cursor uses window pixels 1:1, but the UI sheet the eyes
-	// show is the window's top-left 640x480 (mouse log, 2026-09-24: the
-	// cursor started at the window centre and left the sheet down to y 819).
-	// Confine the system pointer to that rectangle while VR is on, so the
-	// cursor never leaves what both eyes see.
-	struct SdlRect { int x, y, w, h; };
-	typedef int (*SdlSetMouseRect)(void *, const SdlRect *);
-	typedef void (*SdlWarp)(void *, int, int);
-	void *sdl_window()
-	{
-		if (!m_getFocus)
-			m_getFocus = (SdlGetFocus)sdl("SDL_GetMouseFocus");
-		if (!m_getKeyFocus)
-			m_getKeyFocus = (SdlGetFocus)sdl("SDL_GetKeyboardFocus");
-		void *w = m_getFocus ? m_getFocus() : NULL;
-		if (!w && m_getKeyFocus)
-			w = m_getKeyFocus();
-		return w;
-	}
-	void confine_mouse(bool on)
-	{
-		// With GamepadUI the UI is the whole window, so the pointer needs no fence.
-		if (!g_cfg.confine || gamepadui_loaded())
-			return;
-		if (!m_setMouseRect && !m_triedMouseRect) {
-			m_triedMouseRect = true;
-			m_setMouseRect = (SdlSetMouseRect)sdl("SDL_SetWindowMouseRect");
-			m_warp = (SdlWarp)sdl("SDL_WarpMouseInWindow");
-			if (!m_getState)
-				m_getState = (SdlGetMouseState)sdl("SDL_GetMouseState");
-			if (!m_getRel)
-				m_getRel = (SdlGetRelative)sdl("SDL_GetRelativeMouseMode");
-		}
-		void *win = sdl_window();
-		if (!win)
-			return;
-		if (m_setMouseRect) {
-			if (on && win == m_confined)
-				return;
-			SdlRect rc = { 0, 0, 640, 480 };
-			int rv = m_setMouseRect(win, on ? &rc : NULL);
-			m_confined = on ? win : NULL;
-			logf("mouse %s to 640x480 (SDL_SetWindowMouseRect: %d)\n", on ? "confined" : "released", rv);
-			return;
-		}
-		// Older SDL: pull the pointer back each frame while the cursor is
-		// free (menus); relative mode (play) needs nothing.
-		if (on && m_warp && m_getState && !(m_getRel && m_getRel())) {
-			int x, y;
-			m_getState(&x, &y);
-			if (x > 639 || y > 479)
-				m_warp(win, x > 639 ? 639 : x, y > 479 ? 479 : y);
-		}
-	}
-
 	// Diagnostics: the system pointer (SDL, window pixels) next to the game's
-	// UI cursor (VGUI, its 640x480 screen), when either moves.
+	// UI cursor (VGUI), when either moves.
 	void log_mouse()
 	{
 		if (m_mouseLogs >= 400)
@@ -1011,8 +1276,10 @@ public:
 	// the module.
 	void dump(IMatRenderContext *ctx, ITexture *t, const char *name)
 	{
-		int w = t ? t->GetActualWidth() : g_cfg.width;
-		int h = t ? t->GetActualHeight() : g_cfg.height;
+		int fw, fh;
+		frame_size(&fw, &fh);
+		int w = t ? t->GetActualWidth() : fw;
+		int h = t ? t->GetActualHeight() : fh;
 		unsigned char *px = (unsigned char *)malloc((size_t)w * h * 4);
 		if (!px)
 			return;
@@ -1063,27 +1330,30 @@ public:
 		return m;
 	}
 
-	// Called with the game's field of view each frame; keep it for the
-	// projection.
-	// The UI sheet: 640x480, the client's VR UI size, or with GamepadUI the
-	// window's own size, which that UI is laid out in.
-	int ui_width() { return gamepadui_loaded() ? g_cfg.width : 640; }
-	int ui_height() { return gamepadui_loaded() ? g_cfg.height : 480; }
-
+	// The UI sheet is the window's own size: a television shows the HUD and
+	// menus as in 2D, sharp and whole, and the pointer maps 1:1. The client's
+	// 640x480 VR UI size exists for a headset's floating panel (#8297 items 4
+	// and 6).
+	int ui_width() { return g_cfg.width; }
+	int ui_height() { return g_cfg.height; }
 	// The client's Activate() sets the UI to 640x480 (a headset's floating
-	// panel) after the module's; with GamepadUI the module sets it back to the
-	// window's size as soon as the client next calls in (GetRenderTarget),
-	// still inside its Activate(), so every menu fits the sheet.
+	// panel) after the module's; the module sets it back to the window's size
+	// as soon as the client next calls in (GetRenderTarget), still inside its
+	// Activate(), so nothing lays itself out at 640x480 (GamepadUI kept such a
+	// layout, run q06).
 	void ui_full_size()
 	{
-		if (m_uiFull || !gamepadui_loaded() || !m_factory)
+		if (m_uiFull || !m_factory)
 			return;
 		m_uiFull = true;
 		vgui::ISurface *surface = (vgui::ISurface *)m_factory(VGUI_SURFACE_INTERFACE_VERSION, NULL);
 		bool ok = surface && surface->ForceScreenSizeOverride(true, g_cfg.width, g_cfg.height);
-		logf("ui: GamepadUI, laid out at %dx%d (%s)\n", g_cfg.width, g_cfg.height, surface ? (ok ? "ok" : "refused") : "no surface");
+		logf("ui: laid out at %dx%d%s (%s)\n", g_cfg.width, g_cfg.height, gamepadui_loaded() ? ", GamepadUI" : "",
+		     surface ? (ok ? "ok" : "refused") : "no surface");
 	}
 
+	// Called with the game's field of view each frame; keep it for the
+	// projection.
 	bool SampleTrackingState(float playerGameFov, float)
 	{
 		// Called once per frame before the eyes render: a new frame.
@@ -1092,18 +1362,29 @@ public:
 			log_mouse();
 		if (g_cfg.anglelog)
 			record_angles();
-		if (m_active) {
-			confine_mouse(true);
+		if (m_active)
 			ui_full_size();
-		}
 		m_shown[0] = m_shown[1] = false;
 		m_hudCopied = false;
-		if (playerGameFov > 1.0f && playerGameFov < 179.0f) {
-			if (playerGameFov != m_fovX && m_fovLogs < 8) {
+		// The client passes 0 while the view has the game's default field of
+		// view, and otherwise the view's FOV divided by vr_zoom_multiplier (a
+		// headset HUD adjustment). A display needs the real FOV: the default
+		// on 0, the value times the multiplier otherwise. Keeping the last
+		// value on 0 left a changed FOV stuck (HL2:DM at 90 read 45, run r01).
+		float fov = playerGameFov;
+		if (g_pCVar) {
+			static ConVarRef defaultFov("default_fov"), zoomMultiplier("vr_zoom_multiplier");
+			if (fov <= 1.0f)
+				fov = defaultFov.IsValid() ? defaultFov.GetFloat() : 75.0f;
+			else if (zoomMultiplier.IsValid() && zoomMultiplier.GetFloat() > 0.0f)
+				fov *= zoomMultiplier.GetFloat();
+		}
+		if (fov > 1.0f && fov < 179.0f) {
+			if (fov != m_fovX && m_fovLogs < 8) {
 				m_fovLogs++;
-				logf("game fov %.3f at frame %d\n", playerGameFov, m_frame);
+				logf("game fov %.3f (passed %.3f) at frame %d\n", fov, playerGameFov, m_frame);
 			}
-			m_fovX = playerGameFov;
+			m_fovX = fov;
 		}
 		return true;
 	}
@@ -1112,8 +1393,7 @@ public:
 	{
 		r->nX = 0;
 		r->nY = 0;
-		r->nWidth = g_cfg.width;
-		r->nHeight = g_cfg.height;
+		frame_size(&r->nWidth, &r->nHeight);
 		return true;
 	}
 
@@ -1178,7 +1458,9 @@ public:
 	// first use, inside the allocation bracket render targets need.
 	void ensure_targets()
 	{
-		if (m_triedTargets || !g_cfg.enabled || !m_active)
+		if (select_targets())
+			return;
+		if (!g_cfg.enabled || !m_active)
 			return;
 		m_triedTargets = true;
 		if (!m_ms && m_factory) {
@@ -1192,22 +1474,48 @@ public:
 		m_ms->EndRenderTargetAllocation();
 	}
 
+	// Eye targets, one pair per eye size (format and rendering resolution),
+	// made on first use and kept.
+	bool select_targets()
+	{
+		int w, h;
+		eye_size(VREye_Left, &w, &h);
+		for (int i = 0; i < m_nTargets; i++)
+			if (m_targets[i].w == w && m_targets[i].h == h) {
+				m_rt[0] = m_targets[i].rt[0];
+				m_rt[1] = m_targets[i].rt[1];
+				return true;
+			}
+		return false;
+	}
+
 	void make_targets()
 	{
 		IMaterialSystem *ms = m_ms;
-		static const char *names[2] = { "_rt_svrtv_left", "_rt_svrtv_right" };
+		int w, h;
+		eye_size(VREye_Left, &w, &h);
 		for (int i = 0; i < 2; i++) {
-			int w, h;
-			eye_size(i ? VREye_Right : VREye_Left, &w, &h);
-			m_rt[i] = ms->CreateNamedRenderTargetTextureEx(names[i], w, h, RT_SIZE_LITERAL,
+			char name[64];
+			snprintf(name, sizeof(name), "_rt_svrtv_%s_%dx%d", i ? "right" : "left", w, h);
+			m_rt[i] = ms->CreateNamedRenderTargetTextureEx(name, w, h, RT_SIZE_LITERAL,
 				ms->GetBackBufferFormat(), MATERIAL_RT_DEPTH_SHARED,
 				0x4 | 0x8 | 0x100 | 0x200,   // TEXTUREFLAGS_CLAMPS|CLAMPT|NOMIP|NOLOD
 				0);
-			logf("render target %s: %dx%d requested, %dx%d made\n", names[i], w, h,
+			logf("render target %s: %dx%d made\n", name,
 			     m_rt[i] ? m_rt[i]->GetActualWidth() : 0, m_rt[i] ? m_rt[i]->GetActualHeight() : 0);
 		}
 		if (!m_rt[0] || !m_rt[1])
 			m_rt[0] = m_rt[1] = NULL;
+		else if (m_nTargets < MAX_TARGETS) {
+			m_targets[m_nTargets].w = w;
+			m_targets[m_nTargets].h = h;
+			m_targets[m_nTargets].rt[0] = m_rt[0];
+			m_targets[m_nTargets].rt[1] = m_rt[1];
+			m_nTargets++;
+		}
+		if (m_uiMade)
+			return;
+		m_uiMade = true;
 
 		// The HUD sheet. The client paints the HUD and menus into "_rt_gui"
 		// (640x480, with alpha for the in-world HUD material) and this game
@@ -1239,6 +1547,7 @@ public:
 	{
 		trace(3, "ShutdownRenderTargets");
 		m_rt[0] = m_rt[1] = NULL;
+		m_nTargets = 0;
 	}
 	ITexture *GetRenderTarget(VREye eye, EWhichRenderTarget which)
 	{
@@ -1256,8 +1565,7 @@ public:
 	}
 	void GetRenderTargetFrameBufferDimensions(int &w, int &h)
 	{
-		w = g_cfg.width;
-		h = g_cfg.height;
+		frame_size(&w, &h);
 	}
 
 	bool Activate()
@@ -1265,7 +1573,8 @@ public:
 		if (!g_cfg.enabled)
 			return false;
 		m_active = true;
-		logf("activated\n");
+		size_from_mode();
+		logf("activated: %s, %dx%d 2D\n", g_formatNames[g_cfg.format], g_cfg.width, g_cfg.height);
 		command(g_cfg.onvr);
 		if (g_cfg.xhair)
 			crosshair_off();
@@ -1274,6 +1583,8 @@ public:
 		if (g_cfg.aniso > 0)
 			set_for_3d("mat_forceaniso", g_cfg.aniso);
 		launch_3d_mark();
+		frame_mode_on();
+		apply_output();
 		return true;
 	}
 	void Deactivate()
@@ -1281,7 +1592,8 @@ public:
 		m_active = false;
 		logf("deactivated\n");
 		m_uiFull = false;
-		confine_mouse(false);
+		clear_output();
+		frame_mode_off();
 		crosshair_restore();
 		blur_restore();
 		restore_after_3d("mat_forceaniso");
@@ -1289,6 +1601,11 @@ public:
 		if (m_switchOff) {
 			m_switchOff = false;
 			g_cfg.enabled = false;
+		}
+		if (m_relayout) {
+			g_cfg.format = m_relayout - 1;
+			m_relayout = 0;
+			command("vr_activate");
 		}
 	}
 
@@ -1301,10 +1618,22 @@ public:
 		// left by a launch-option session that quit in 3D goes first. Only on
 		// the first call, at startup: the client asks again from its own
 		// Activate(), after the module has marked 3D on (run q05).
-		if (!m_startupDone)
+		if (!m_startupDone) {
 			launch_3d_unmark();
-		if (!g_cfg.enabled && vr_display_3d.GetBool())
+			if (g_pCVar) {
+				g_cfg.output = vr_display_output.GetInt();
+				g_cfg.swap = vr_display_swap.GetBool();
+			}
+		}
+		if (!g_cfg.enabled && vr_display_3d.GetInt() > 0) {
 			g_cfg.enabled = true;
+			g_cfg.format = vr_display_layout.GetInt();
+		} else if (g_cfg.enabled && !g_cfg.layoutGiven && !m_startupDone)
+			g_cfg.format = vr_display_layout.GetInt();   // -stereo3d alone: the saved format
+		// A video mode left by a session that quit in a full format: kept when
+		// 3D starts in one again, put back otherwise.
+		if (!m_startupDone && !(g_cfg.enabled && needs_frame_mode()))
+			frame_mode_off();
 		m_startupDone = true;
 		if (!g_cfg.enabled || !g_cfg.xhair)
 			crosshair_restore();
@@ -1315,21 +1644,40 @@ public:
 		return g_cfg.enabled;
 	}
 
-	// vr_display_3d changed while the game runs (the video options, or the
-	// console). Before startup completes it is config.cfg loading the saved
-	// value, which ShouldForceVRMode() reads instead.
-	void display_3d(bool on)
+	// A setting changed while the game runs. The video options write the
+	// three on Apply one after another and give no signal when done, so the
+	// reload runs once, on the next engine frame (a console command), after
+	// the last. Before startup completes it is config.cfg loading the saved
+	// values, which ShouldForceVRMode() reads.
+	void queue_apply()
 	{
-		if (m_unmarking || !m_startupDone || on == (g_cfg.enabled && m_active))
+		if (m_selfSet || !m_startupDone || m_applyQueued)
 			return;
-		if (on) {
-			g_cfg.enabled = true;
-			command("vr_activate");
-		} else {
-			// The client's Deactivate() first asks ShouldRunInVR(); 3D stays on
-			// until it has run, and Deactivate() below turns it off.
-			m_switchOff = true;
+		m_applyQueued = true;
+		command("vr_display_apply");
+	}
+	// Apply (Daniel's design): read all three settings and apply them at
+	// once, with one full reload of the 3D path: the client's own deactivate,
+	// then activate with the new values (instant, run q07).
+	void apply_settings()
+	{
+		m_applyQueued = false;
+		launch_3d_forget();
+		bool on = vr_display_3d.GetInt() > 0;
+		int format = vr_display_layout.GetInt();
+		g_cfg.output = vr_display_output.GetInt();
+		g_cfg.swap = vr_display_swap.GetBool();
+		if (g_cfg.enabled && m_active) {
+			// Deactivate() below activates again with the new settings, or ends
+			// 3D; the client's Deactivate() first asks ShouldRunInVR(), so 3D
+			// stays on until it has run.
+			m_relayout = on ? format + 1 : 0;
+			m_switchOff = !on;
 			command("vr_deactivate");
+		} else if (on) {
+			g_cfg.enabled = true;
+			g_cfg.format = format;
+			command("vr_activate");   // Activate() applies the output
 		}
 	}
 	void SetShouldForceVRMode() {}
@@ -1350,6 +1698,21 @@ private:
 	IMaterialSystem *m_ms;
 	CreateInterfaceFn m_factory;
 	bool m_triedTargets;
+	enum { MAX_TARGETS = 8 };
+	struct EyeTargets { int w, h; ITexture *rt[2]; };
+	EyeTargets m_targets[MAX_TARGETS];   // one pair per eye size
+	int m_nTargets;
+	bool m_uiMade;              // HUD sheets made (shared by both layouts)
+	bool m_applyQueued;         // vr_display_apply queued, not yet run
+	bool m_effectSet;           // a gamescope effect is set by the module
+	bool m_xTried;
+	void *m_xdpy;
+	XInternAtomFn m_xInternAtom;
+	XDefaultRootWindowFn m_xRoot;
+	XChangePropertyFn m_xChange;
+	XDeletePropertyFn m_xDelete;
+	XFlushFn m_xFlush;
+	int m_relayout;             // Apply while on: the format + 1 to activate again with, in Deactivate()
 	ITexture *m_rt[2];
 	bool m_shown[2];
 	bool m_traced[8];
@@ -1366,10 +1729,6 @@ private:
 	bool m_sdlLooked;
 	void *m_sdlLib;
 	SdlGetFocus m_getKeyFocus;
-	SdlSetMouseRect m_setMouseRect;
-	SdlWarp m_warp;
-	bool m_triedMouseRect;
-	void *m_confined;
 	SdlGetMouseState m_getState;
 	SdlGetFocus m_getFocus;
 	SdlGetWindowSize m_getSize;
@@ -1377,17 +1736,24 @@ private:
 	int m_mouseLogs;
 	int m_lastMouse[4];
 	bool m_startupDone;
-	bool m_unmarking;   // the module resetting vr_display_3d itself (launch_3d_unmark)
+	bool m_selfSet;   // the module resetting vr_display_3d itself (launch_3d_unmark)
 	bool m_uiFull;      // GamepadUI: the UI set to the window size for this activation
 	bool m_switchOff;   // vr_display_3d 0: 3D ends once the client has deactivated
 };
 
 CSourceVRTelevision g_television;
 
-static void display_3d_changed(IConVar *var, const char *oldValue, float oldFloat)
+static void display_changed(IConVar *var, const char *oldValue, float oldFloat)
 {
-	g_television.display_3d(vr_display_3d.GetBool());
+	g_television.queue_apply();
 }
+
+static void display_apply(const CCommand &args)
+{
+	g_television.apply_settings();
+}
+static ConCommand vr_display_apply("vr_display_apply", display_apply,
+	"Applies vr_display_3d, vr_display_layout, vr_display_output and vr_display_swap together (the video options' Apply)");
 
 } // namespace
 

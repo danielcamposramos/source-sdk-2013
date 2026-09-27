@@ -154,6 +154,8 @@ private:
 	bool m_bNonVRWindowed;
 	int m_nNonVRWidth;
 	int m_nNonVRHeight;
+	bool m_bChangedVideoMode;	// Activate() set the video mode, so Deactivate() puts it back
+	bool m_bDisplay;			// the VR module drives a stereoscopic display (ISourceVRDisplay)
 #if defined( USE_SDL )
     int m_nNonVRSDLDisplayIndex;
 #endif

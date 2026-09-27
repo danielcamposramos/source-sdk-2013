@@ -24,15 +24,12 @@
 abstract_class ISourceVRDisplay
 {
 public:
-	enum EOutput
-	{
-		OUTPUT_SIDE_BY_SIDE = 0,	// both eyes in one frame, left eye first
-	};
-
-	// True while the two eyes are being shown on a stereoscopic display.
-	virtual bool IsDisplayActive() = 0;
-
-	virtual EOutput GetOutput() = 0;
+	// True while the stereoscopic display is the headset: the eyes are
+	// rendered for it (play, with no headset connected). False when a real
+	// headset is connected and the display only mirrors its eyes (spectate):
+	// then the client keeps every headset behaviour (its 640x480 UI panel,
+	// the in-world HUD), and the module composes the display's view itself.
+	virtual bool IsDisplayTheHeadset() = 0;
 };
 
 //-----------------------------------------------------------------------------
@@ -45,12 +42,13 @@ inline ISourceVRDisplay *SourceVRDisplay()
 	return (ISourceVRDisplay *)g_pSourceVR->QueryInterface( SOURCE_VR_DISPLAY_INTERFACE_VERSION );
 }
 
+// True while the game renders for a stereoscopic display instead of a headset.
 inline bool UseVRDisplay()
 {
 	if ( !UseVR() )
 		return false;
 	ISourceVRDisplay *pDisplay = SourceVRDisplay();
-	return pDisplay != NULL && pDisplay->IsDisplayActive();
+	return pDisplay != NULL && pDisplay->IsDisplayTheHeadset();
 }
 
 #endif // ISOURCEVRDISPLAY_H
