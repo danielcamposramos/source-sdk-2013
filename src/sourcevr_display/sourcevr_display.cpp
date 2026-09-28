@@ -568,6 +568,11 @@ public:
 		if (g_cfg.eyew > 0 && g_cfg.eyeh > 0) {
 			*w = g_cfg.eyew;
 			*h = g_cfg.eyeh;
+		} else if (full_eyes()) {
+			// The full formats render each eye at the whole 2D size and
+			// shrink it into its half of the frame: supersampled, sharper.
+			*w = g_cfg.width;
+			*h = g_cfg.height;
 		} else
 			half(eye, NULL, NULL, w, h);
 	}
@@ -578,8 +583,24 @@ public:
 	int packing()
 	{
 		if (g_cfg.output != OUT_DISPLAY && (g_cfg.format == FMT_FP1080 || g_cfg.format == FMT_FP720))
-			return FMT_TAB_FULL;
+			return FMT_TAB;
+		// The frame is always the screen the game already has: the full
+		// formats pack their full-size eyes into the half layout, so no video
+		// mode or gamescope screen is ever resized for them (a resized
+		// gamescope screen needed -S stretch, which breaks the mouse, q23).
+		if (g_cfg.format == FMT_TAB_FULL)
+			return FMT_TAB;
+		if (g_cfg.format == FMT_SBS_FULL)
+			return FMT_SBS;
 		return g_cfg.format;
+	}
+	// Full formats: eyes rendered at the whole 2D size (Daniel: render in high
+	// resolution, even if it is shrunk into the half formats' layout).
+	bool full_eyes()
+	{
+		int f = g_cfg.format;
+		return f == FMT_TAB_FULL || f == FMT_SBS_FULL
+			|| (g_cfg.output != OUT_DISPLAY && (f == FMT_FP1080 || f == FMT_FP720));
 	}
 	bool packed_tab() { int f = packing(); return f == FMT_TAB || f == FMT_TAB_FULL; }
 
@@ -1108,10 +1129,13 @@ public:
 			g_cfg.height = h;
 		}
 	}
+	// Only native frame packing needs a video mode of its own (the HDMI 3D
+	// modes, once the kernel lists them); every other format uses the screen
+	// as it is.
 	bool needs_frame_mode()
 	{
 		int f = g_cfg.format;
-		return f == FMT_TAB_FULL || f == FMT_SBS_FULL || f == FMT_FP1080 || f == FMT_FP720;
+		return !in_gamescope() && g_cfg.output == OUT_DISPLAY && (f == FMT_FP1080 || f == FMT_FP720);
 	}
 	// gamescope's nested screen is sized at its start (the 2D size); its
 	// root-window property GAMESCOPE_XWAYLAND_MODE_CONTROL = [server, width,
@@ -1132,6 +1156,8 @@ public:
 	}
 	void frame_mode_on()
 	{
+		if (!needs_frame_mode())
+			return;
 		int fw, fh, w, h;
 		bool windowed;
 		frame_size(&fw, &fh);
