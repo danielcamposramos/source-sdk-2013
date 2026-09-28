@@ -2,17 +2,17 @@
 
 A VR module (`sourcevr.so`) that presents a stereoscopic display (a 3D TV, a projector, any screen with anaglyph glasses) to the engine as its headset. Source games from the 2013 SteamVR era still carry Valve's VR render path; with this module the engine itself renders both eyes, with real stereo geometry, into one frame the display unpacks. No per-game shader fixes, no wrapper around the renderer.
 
-**This branch (`stereo3d-full-res-wip`) carries the full formats**, played on the TV on 2026-09-28 (run q24): each eye rendered at the whole 2D size (1920x1080) and shrunk into the frame the screen already has, supersampled, sharper, distant things less pixelated. Nothing is resized: no video mode, no gamescope screen change, no `-S stretch` (which breaks the relative mouse, run q23). Full top and bottom is the new recommended default. The mouse regression of run q21 is fixed (run q22, `2bc521b`). The branch `stereo3d-sbs-native` holds the Windows port; the two meet before the pull request.
+**This branch (`stereo3d-full-res-wip`) is the version played on a 3D TV** (module `ed82a30e`, rebuilt byte-identically by `build32-hl2.sh`). It adds the full formats: each eye rendered at the whole 2D size (1920x1080) and shrunk into the frame the screen already has, supersampled, sharper, distant things less pixelated and no texture popping (run q24). Nothing is resized: no video mode, no gamescope screen change, no `-S stretch` (which breaks the relative mouse, run q23). Full top and bottom is the recommended default. Every format and output has run on the TV: natively (run q26) and through gamescope, anaglyph included (runs q24 and q27). The mouse regression of run q21 is fixed (run q22, `2bc521b`). The branch `stereo3d-sbs-native` holds the earlier played version (`5db63a08`, half formats) and the Windows port; the two meet before the pull request.
 
-Status: work in progress, being prepared as a pull request to Valve. The branch `stereo3d-sbs-native` is the version played on a 3D TV (module `5db63a08`, rebuilt byte-identically by `build32-hl2.sh`). Where it fails is listed below, plainly; we are already chasing those fixes. The story, measurements and dated test runs are in [sony-bravia-linux](https://github.com/danielcamposramos/sony-bravia-linux/tree/main/tools/vr-stereo-spectator); the reports to Valve are [Source-1-Games#8297](https://github.com/ValveSoftware/Source-1-Games/issues/8297) and [SteamVR-for-Linux#961](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/961).
+Status: work in progress, being prepared as a pull request to Valve. Where it fails is listed below, plainly; we are already chasing those fixes. The story, measurements and dated test runs are in [sony-bravia-linux](https://github.com/danielcamposramos/sony-bravia-linux/tree/main/tools/vr-stereo-spectator); the reports to Valve are [Source-1-Games#8297](https://github.com/ValveSoftware/Source-1-Games/issues/8297) and [SteamVR-for-Linux#961](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/961).
 
 ## What works
 
-Played on a Sony KDL-46HX855 over HDMI, Half-Life 2 (native Linux, Vulkan), NVIDIA RTX 3060 (driver 615.71.09), Debian testing, KDE Plasma on Wayland, 2026-09-26.
+Played on a Sony KDL-46HX855 over HDMI, Half-Life 2 (native Linux, Vulkan), NVIDIA RTX 3060 (driver 615.71.09), Debian testing, KDE Plasma on Wayland, 2026-09-26 to 2026-09-28.
 
 - A 3D section in the game's own options (GamepadUI, Options > Video): Stereo 3D, 3D format, 3D output, Swap eyes. Nothing changes until Apply, which reloads 3D once with all four. The choice is saved; the next launch starts in it.
-- Native, the game straight to the 3D display: top and bottom, full (recommended, the default), side by side, full, and the half formats, the lighter option for weaker machines. The full formats natively are new and not yet run on the TV (they need no video mode now); the half formats are as played.
-- Through gamescope: the same four formats (full ones played on the TV, run q24), with the outputs 3D display, red/cyan anaglyph (CRT and modern-screen profiles), row-interleaved and checkerboard, switched from the menu with no relaunch.
+- Native, the game straight to the 3D display: top and bottom, full (recommended, the default), side by side, full, and the half formats, the lighter option for weaker machines. All four switch from the menu on Apply (run q26).
+- Through gamescope: the same four formats (runs q24 and q27), with the outputs 3D display, red/cyan anaglyph (CRT and modern-screen profiles), row-interleaved and checkerboard, switched from the menu with no relaunch.
 - Swap eyes; the menus and HUD at full size, at zero depth; the launch option `-stereo3d`.
 - While 3D is on, the module turns motion blur off (its previous-frame state is shared by both eyes and smears differently in each) and sets anisotropic filtering to 16x; the player's own values come back when 3D ends, or at the next start if the game quit in 3D.
 
@@ -33,12 +33,12 @@ You need a 3D display that accepts half top and bottom or half side by side over
 ### 1. Build the module
 
 ```sh
-git clone -b stereo3d-sbs-native https://github.com/danielcamposramos/source-sdk-2013.git
+git clone -b stereo3d-full-res-wip https://github.com/danielcamposramos/source-sdk-2013.git
 cd source-sdk-2013/src/sourcevr_display
 ./build32-hl2.sh "$HOME/.steam/steam/steamapps/common/Half-Life 2/bin" out
 ```
 
-Use your own library path for `Half-Life 2/bin`. The script builds in Valve's Steam Runtime SDK image and prints the module's SHA-256; `stereo3d-sbs-native` gives `5db63a08…`, the played build.
+Use your own library path for `Half-Life 2/bin`. The script builds in Valve's Steam Runtime SDK image and prints the module's SHA-256; `stereo3d-full-res-wip` gives `ed82a30e…`, the played build.
 
 ### 2. Install it
 

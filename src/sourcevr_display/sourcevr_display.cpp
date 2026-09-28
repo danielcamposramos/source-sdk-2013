@@ -602,15 +602,13 @@ public:
 		return f == FMT_TAB_FULL || f == FMT_SBS_FULL
 			|| (g_cfg.output != OUT_DISPLAY && (f == FMT_FP1080 || f == FMT_FP720));
 	}
-	bool packed_tab() { int f = packing(); return f == FMT_TAB || f == FMT_TAB_FULL; }
+	bool packed_tab() { return packing() == FMT_TAB; }
 
 	// The output frame's size.
 	void frame_size(int *w, int *h)
 	{
 		int W = g_cfg.width, H = g_cfg.height;
 		switch (packing()) {
-		case FMT_TAB_FULL: *w = W; *h = 2 * H; break;
-		case FMT_SBS_FULL: *w = 2 * W; *h = H; break;
 		case FMT_FP1080: *w = 1920; *h = 2205; break;
 		case FMT_FP720: *w = 1280; *h = 1470; break;
 		default: *w = W; *h = H; break;
@@ -628,8 +626,6 @@ public:
 		switch (packing()) {
 		case FMT_SBS: vw = W / 2; vx = first ? 0 : W / 2; break;
 		case FMT_TAB: vh = H / 2; vy = first ? 0 : H / 2; break;
-		case FMT_TAB_FULL: vy = first ? 0 : H; break;
-		case FMT_SBS_FULL: vx = first ? 0 : W; break;
 		case FMT_FP1080: vw = 1920; vh = 1080; vy = first ? 0 : 1125; break;
 		case FMT_FP720: vw = 1280; vh = 720; vy = first ? 0 : 750; break;
 		}
@@ -1063,19 +1059,10 @@ public:
 				gamescope_effect(-1);
 			return;
 		}
-		// svrtv-anaglyph.fx techniques by packing: side by side, top and
-		// bottom, full side by side, full top and bottom. The full ones keep the
-		// rows and checkerboard whole through gamescope's 2:1 scaling (9-11).
-		static const int techniques[OUT_COUNT][4] = {
-			{ -1, -1, -1, -1 },   // the 3D display: no effect
-			{ 0, 3, 0, 3 },       // anaglyph, CRT
-			{ 1, 4, 1, 4 },       // anaglyph, modern screens
-			{ 6, 5, 6, 9 },       // rows
-			{ 7, 8, 10, 11 },     // checkerboard
-		};
-		int f = packing();
-		int column = f == FMT_SBS_FULL ? 2 : f == FMT_TAB_FULL ? 3 : packed_tab() ? 1 : 0;
-		gamescope_effect(techniques[out][column]);
+		// svrtv-anaglyph.fx techniques, from side by side / from top and bottom.
+		// The full formats pack into the same screen, so they use the same ones.
+		static const int techniques[OUT_COUNT][2] = { { -1, -1 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
+		gamescope_effect(techniques[out][packed_tab() ? 1 : 0]);
 	}
 	void clear_output()
 	{
@@ -1137,23 +1124,6 @@ public:
 		int f = g_cfg.format;
 		return !in_gamescope() && g_cfg.output == OUT_DISPLAY && (f == FMT_FP1080 || f == FMT_FP720);
 	}
-	// gamescope's nested screen is sized at its start (the 2D size); its
-	// root-window property GAMESCOPE_XWAYLAND_MODE_CONTROL = [server, width,
-	// height, allow bigger than the output] resizes it at run time (Steam's
-	// own gamescope session changes game resolutions this way). The full
-	// formats set it to the frame size first, so the game's mode is granted
-	// (run q18: without it the buffer stayed 1920x1080).
-	void gamescope_screen(int w, int h)
-	{
-		if (!in_gamescope() || !x11())
-			return;
-		unsigned long root = m_xRoot(m_xdpy);
-		unsigned long atom = m_xInternAtom(m_xdpy, "GAMESCOPE_XWAYLAND_MODE_CONTROL", 0);
-		long mode[4] = { 0, w, h, 1 };
-		m_xChange(m_xdpy, root, atom, 6 /* XA_CARDINAL */, 32, 0 /* PropModeReplace */, (const unsigned char *)mode, 4);
-		m_xFlush(m_xdpy);
-		logf("gamescope screen set to %dx%d\n", w, h);
-	}
 	void frame_mode_on()
 	{
 		if (!needs_frame_mode())
@@ -1173,7 +1143,6 @@ public:
 				fclose(f);
 			}
 		}
-		gamescope_screen(fw, fh);
 		char cmd[96];
 		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", fw, fh, windowed ? 1 : 0);
 		command(cmd);
@@ -1202,7 +1171,6 @@ public:
 		char cmd[96];
 		snprintf(cmd, sizeof(cmd), "mat_setvideomode %d %d %d", w, h, windowed);
 		command(cmd);
-		gamescope_screen(w, h);
 	}
 
 	// Anisotropic filtering 16x while 3D is on: slanted surfaces stay sharp
