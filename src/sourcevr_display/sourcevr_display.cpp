@@ -35,6 +35,10 @@
 //   SVRTV_CALLTRACE    1 logs every gap over 200 ms between the calls the
 //                      module receives, and the calls made while the engine
 //                      draws its loading image (diagnostics)
+//   SVRTV_SCREENSHOTS  0 leaves screenshots to Steam and the engine as in 2D
+//                      (default 1: while 3D is on, every screenshot is a
+//                      stereo one, from both eyes at their full size, before
+//                      packing and anaglyph; see stereo_shot.h)
 //
 // In the game, 3D is switched on by any of: -stereo3d on the command line (a
 // launch option, in the saved format; -stereo3d tab|sbs forces one), the saved settings the
@@ -52,6 +56,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "sourcevr/isourcevirtualreality.h"
 #include "materialsystem/imaterialsystem.h"
@@ -66,6 +75,9 @@
 #include "sourcevr/isourcevrdisplay.h"
 #include "vgui/IInput.h"
 #include "vgui/ISurface.h"
+#include "steam/isteamremotestorage.h"   // PublishedFileId_t, used by isteamscreenshots.h
+#include "steam/isteamscreenshots.h"
+#include "stereo_shot.h"
 #ifdef _WIN32
 #include "winlite.h"
 #include <direct.h>
@@ -133,6 +145,7 @@ struct Config {
 	int dumpevery;    // diagnostics: after SVRTV_DUMP, a frame every n frames
 	bool calltrace;   // diagnostics: log the gaps between the calls the module receives
 	bool loading;     // gamescope: frames marked, loading screens whole in both eyes
+	bool shots;       // stereo screenshots while 3D is on
 	bool xhair;       // the module draws the crosshair on the 2D layer (client's off)
 	bool bluroff;     // motion blur off while VR is on, the player's setting restored after
 	int aniso;        // mat_forceaniso while VR is on (0 leaves it), the player's setting restored after
@@ -425,6 +438,10 @@ void load_config()
 	// stereo art natively (loading_startup); 0 leaves them as the game draws
 	// them.
 	g_cfg.loading = env_double("SVRTV_LOADINGSCREEN", 1) != 0;
+	// Screenshots while 3D is on: both eyes, full size, in Valve's stereo
+	// type plus JPS, MPO and the anaglyph when that is the output (Daniel,
+	// 2026-09-28: "video capture in 3D is a must", screenshots first).
+	g_cfg.shots = env_double("SVRTV_SCREENSHOTS", 1) != 0;
 	// Source keeps motion blur's previous view in statics shared by both eyes
 	// (viewpostprocess.cpp), so in stereo each eye blurs differently during a
 	// turn; with it on, the mouse felt wrecked (Daniel, run p20, 2026-09-26).
@@ -500,12 +517,76 @@ static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
 	"1 when the game runs outside gamescope (set by the VR module)");
 
 
+// Stereo screenshots (Daniel, 2026-09-28). While 3D is on the module takes
+// over Steam's screenshot key, as Team Fortress 2's client already does
+// (clientmode_tf.cpp: HookScreenshots, OnScreenshotRequested): Steam then
+// asks the game for the picture, and the module files a stereo screenshot of
+// Valve's own type (k_EVRScreenshotType_Stereo, the one SteamVR writes), with
+// JPS, MPO and the anaglyph beside it (stereo_shot.cpp). Source already takes
+// its VR screenshots without the lens (view.cpp: bDoUndistort =
+// !engine->IsTakingScreenshot()); these are also both eyes. Steam's flat API
+// is looked up in the game's own steam_api at run time, as SDL is: no link.
+typedef ISteamScreenshots *(*SteamScreenshotsFn)(void);
+typedef void (*HookScreenshotsFn)(ISteamScreenshots *, bool);
+typedef ScreenshotHandle (*AddVRScreenshotFn)(ISteamScreenshots *, EVRScreenshotType, const char *, const char *);
+typedef bool (*SetLocationFn)(ISteamScreenshots *, ScreenshotHandle, const char *);
+typedef void (*RegisterCallbackFn)(CCallbackBase *, int);
+typedef void (*UnregisterCallbackFn)(CCallbackBase *);
+
+static std::atomic<int> g_shotRequests(0);   // Steam's key pressed while the module holds it
+class ShotRequested : public CCallbackBase {
+public:
+	void Run(void *) { g_shotRequests++; }
+	void Run(void *p, bool, SteamAPICall_t) { Run(p); }
+	int GetCallbackSizeBytes() { return (int)sizeof(ScreenshotRequested_t); }
+};
+static ShotRequested g_shotRequested;
+
+// A screenshot read back on the game's thread, written on its own.
+struct ShotJob {
+	StereoShot shot;
+	unsigned char *eyes[2];
+	char base[1024];
+	char location[128];
+	char model[64];
+	bool steam;          // asked for by Steam's key: goes into Steam's library
+	bool ok;
+	char err[512];
+	StereoShotFiles files;
+};
+static std::mutex g_shotMutex;
+static std::vector<ShotJob *> g_shotDone;
+static std::atomic<int> g_shotsWriting(0);
+static void shot_write(ShotJob *job)
+{
+	job->ok = stereo_shot_write(job->shot, &job->files, job->err, sizeof(job->err));
+	free(job->eyes[0]);
+	free(job->eyes[1]);
+	job->eyes[0] = job->eyes[1] = NULL;
+	std::lock_guard<std::mutex> lock(g_shotMutex);
+	g_shotDone.push_back(job);
+	g_shotsWriting--;
+}
+
 class CSourceVRTelevision : public ISourceVirtualReality, public ISourceVRDisplay
 {
 public:
 	CSourceVRTelevision() : m_active(false), m_clientCrosshair(false), m_lastCall(0), m_lastLoadingLog(0), m_lastWhat(""), m_fovX(75.0f), m_ms(NULL), m_factory(NULL), m_triedTargets(false)
 	{
 		m_rt[0] = m_rt[1] = NULL;
+		m_shotRT = NULL;
+		m_hudMatUsed = NULL;
+		m_hudSheetUsed = NULL;
+		m_hudTranslucent = true;
+		m_engineShot = false;
+		m_steamLooked = false;
+		m_steamLib = NULL;
+		m_shotsApi = NULL;
+		m_hookShots = NULL;
+		m_addVRShot = NULL;
+		m_setLocation = NULL;
+		m_unregister = NULL;
+		m_shotsHooked = false;
 		m_shown[0] = m_shown[1] = false;
 		for (int i = 0; i < 8; i++)
 			m_traced[i] = false;
@@ -572,6 +653,12 @@ public:
 	}
 	void Disconnect()
 	{
+		shots_hook(false);
+		if (m_unregister)
+			m_unregister(&g_shotRequested);
+		for (int i = 0; i < 200 && g_shotsWriting > 0; i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		shot_finish();
 		ConVar_Unregister();
 		DisconnectTier1Libraries();
 	}
@@ -750,8 +837,10 @@ public:
 			composite_eye(VREye_Left, ndc, translucent);
 			ok = composite_eye(VREye_Right, ndc, translucent);
 		}
-		if (eye == VREye_Right)
+		if (eye == VREye_Right) {
 			mark_frame();
+			shot_frame();
+		}
 		return ok;
 	}
 
@@ -779,6 +868,241 @@ public:
 		ctx->ClearColor4ub(255, 0, 255, 255);
 		ctx->ClearBuffers(true, false);
 		ctx->PopRenderTargetAndViewport();
+	}
+
+	// Stereo screenshots: Steam's flat API in the game's own steam_api.
+	void *steam_api(const char *name)
+	{
+#ifdef _WIN32
+		if (!m_steamLib)
+			m_steamLib = (void *)GetModuleHandleA(sizeof(void *) == 8 ? "steam_api64.dll" : "steam_api.dll");
+		return m_steamLib ? (void *)GetProcAddress((HMODULE)m_steamLib, name) : NULL;
+#else
+		if (!m_steamLib)
+			m_steamLib = dlopen("libsteam_api.so", RTLD_NOW | RTLD_NOLOAD);
+		return m_steamLib ? dlsym(m_steamLib, name) : dlsym(RTLD_DEFAULT, name);
+#endif
+	}
+	bool steam_shots()
+	{
+		if (m_steamLooked)
+			return m_shotsApi != NULL;
+		m_steamLooked = true;
+		SteamScreenshotsFn get = (SteamScreenshotsFn)steam_api("SteamAPI_SteamScreenshots_v003");
+		m_hookShots = (HookScreenshotsFn)steam_api("SteamAPI_ISteamScreenshots_HookScreenshots");
+		m_addVRShot = (AddVRScreenshotFn)steam_api("SteamAPI_ISteamScreenshots_AddVRScreenshotToLibrary");
+		m_setLocation = (SetLocationFn)steam_api("SteamAPI_ISteamScreenshots_SetLocation");
+		RegisterCallbackFn reg = (RegisterCallbackFn)steam_api("SteamAPI_RegisterCallback");
+		m_unregister = (UnregisterCallbackFn)steam_api("SteamAPI_UnregisterCallback");
+		m_shotsApi = get ? get() : NULL;
+		if (m_shotsApi && m_hookShots && m_addVRShot && reg)
+			reg(&g_shotRequested, ScreenshotRequested_t::k_iCallback);
+		else {
+			m_shotsApi = NULL;
+			m_unregister = NULL;
+		}
+		logf("stereo screenshots: Steam's screenshot interface %s\n",
+		     m_shotsApi ? "found" : "not found (the engine's screenshot key still makes them)");
+		return m_shotsApi != NULL;
+	}
+	// While 3D is on, Steam's screenshot key is the module's; handed back
+	// when 3D stops (Steam takes its own 2D screenshots again).
+	void shots_hook(bool on)
+	{
+		if (!g_cfg.shots || on == m_shotsHooked)
+			return;
+		if (on && !steam_shots())
+			return;
+		if (!m_shotsApi)
+			return;
+		m_hookShots(m_shotsApi, on);
+		m_shotsHooked = on;
+		if (!on)
+			g_shotRequests = 0;
+		logf("stereo screenshots: Steam's screenshot key %s\n",
+		     on ? "taken (every screenshot in 3D is a stereo one)" : "handed back");
+	}
+	// Once a frame, after both eyes: a screenshot asked for by Steam's key,
+	// or by the engine's own (it is taking one now), then the finished ones.
+	void shot_frame()
+	{
+		if (g_cfg.shots) {
+			IVEngineClient *e = engine();
+			bool engineShot = e && e->IsTakingScreenshot();
+			int requests = g_shotRequests.exchange(0);
+			if (requests > 0 && m_shotsHooked)
+				shot_take(true);
+			else if (engineShot && !m_engineShot)
+				shot_take(false);
+			m_engineShot = engineShot;
+		}
+		shot_finish();
+	}
+	// <game>/screenshots/stereo3d/<map>_<date>_<time>_<frame>
+	void shot_base(char *out, size_t n, char *location, size_t ln)
+	{
+		IVEngineClient *e = engine();
+		const char *gd = e ? e->GetGameDirectory() : NULL;
+		char dir[1024];
+		if (gd && *gd)
+			snprintf(dir, sizeof(dir), "%s/screenshots/stereo3d/", gd);
+		else
+			snprintf(dir, sizeof(dir), "%sscreenshots/stereo3d/", g_dir);
+		const char *level = e ? e->GetLevelName() : NULL;   // maps/<name>.bsp
+		char map[128] = "menu";
+		if (level && *level) {
+			const char *b = strrchr(level, '/');
+			snprintf(map, sizeof(map), "%s", b ? b + 1 : level);
+			char *dot = strrchr(map, '.');
+			if (dot)
+				*dot = 0;
+		}
+		snprintf(location, ln, "%s", map);
+		time_t now = time(NULL);
+		struct tm tmv;
+#ifdef _WIN32
+		localtime_s(&tmv, &now);
+#else
+		localtime_r(&now, &tmv);
+#endif
+		char stamp[32];
+		strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tmv);
+		snprintf(out, n, "%s%s_%s_%d", dir, map, stamp, m_frame);
+		make_dirs(out);
+	}
+	// Both eyes as rendered (full size in the full formats), each with this
+	// frame's HUD painted over it on the screen plane as the player saw it
+	// (established solution 1), read back before packing and before any
+	// anaglyph; the files are written on their own thread.
+	void shot_take(bool steam)
+	{
+		int w, h;
+		eye_size(VREye_Left, &w, &h);
+		if (!m_ms || !m_rt[0] || !m_rt[1] || !m_shotRT) {
+			logf("stereo screenshot: NOT taken (no eye targets%s)\n", m_shotRT ? "" : ", no screenshot target");
+			return;
+		}
+		ShotJob *job = new ShotJob;
+		memset(job, 0, sizeof(*job));
+		size_t bytes = (size_t)w * h * 4;
+		job->eyes[0] = (unsigned char *)malloc(bytes);
+		job->eyes[1] = (unsigned char *)malloc(bytes);
+		if (!job->eyes[0] || !job->eyes[1]) {
+			free(job->eyes[0]);
+			free(job->eyes[1]);
+			delete job;
+			logf("stereo screenshot: NOT taken (out of memory for %dx%d)\n", w, h);
+			return;
+		}
+		CMatRenderContextPtr ctx(m_ms);
+		for (int i = 0; i < 2; i++) {
+			Rect_t src = { 0, 0, w, h };
+			Rect_t dst = { 0, 0, w, h };
+			ctx->PushRenderTargetAndViewport(m_shotRT, 0, 0, w, h);
+			ctx->CopyTextureToRenderTargetEx(0, m_rt[i], &src, &dst);
+			if (m_hudMatUsed && m_hudSheetUsed) {
+				int x0, y0, x1, y1;
+				hud_rect(0, 0, w, h, &x0, &y0, &x1, &y1);
+				if (x1 > x0 && y1 > y0)
+					paint_hud(ctx, m_hudMatUsed, m_hudSheetUsed, x0, y0, x1 - x0, y1 - y0, m_hudTranslucent);
+			}
+			ctx->ReadPixels(0, 0, w, h, job->eyes[i], IMAGE_FORMAT_BGRA8888);
+			ctx->PopRenderTargetAndViewport();
+		}
+		shot_base(job->base, sizeof(job->base), job->location, sizeof(job->location));
+		const char *game = CommandLine()->ParmValue("-game", "hl2");
+		const char *slash = strrchr(game, '/');
+		snprintf(job->model, sizeof(job->model), "%s", slash ? slash + 1 : game);
+		job->steam = steam;
+		StereoShot &s = job->shot;
+		s.w = w;
+		s.h = h;
+		// The swap switch changes which half each eye fills, not which eye
+		// is which: these are always the left and right eyes.
+		s.eye[0] = job->eyes[0];
+		s.eye[1] = job->eyes[1];
+		s.base = job->base;
+		s.anaglyph = g_cfg.output == OUT_ANAGLYPH_CRT ? STEREO_SHOT_ANAGLYPH_CRT
+		           : g_cfg.output == OUT_ANAGLYPH_MODERN ? STEREO_SHOT_ANAGLYPH_MODERN
+		           : STEREO_SHOT_NO_ANAGLYPH;
+		// Game units are inches (the separation's default, 2.5, is about
+		// 64 mm); the eyes are parallel, their views shifted to meet at the
+		// screen plane, so the lines of sight never converge.
+		s.baselineMetres = g_cfg.separation * 0.0254;
+		s.convergenceDegrees = 0.0;
+		s.make = "sourcevr_display";
+		s.model = job->model;
+		s.when = time(NULL);
+		g_shotsWriting++;
+		std::thread(shot_write, job).detach();
+		logf("stereo screenshot: %dx%d per eye, asked by %s, writing %s\n", w, h,
+		     steam ? "Steam's key" : "the engine's screenshot", job->base);
+	}
+	// Finished screenshots: logged, and the ones Steam asked for go into its
+	// library as stereo screenshots (preview: the left eye).
+	void shot_finish()
+	{
+		std::vector<ShotJob *> done;
+		{
+			std::lock_guard<std::mutex> lock(g_shotMutex);
+			done.swap(g_shotDone);
+		}
+		for (size_t i = 0; i < done.size(); i++) {
+			ShotJob *job = done[i];
+			if (!job->ok)
+				logf("stereo screenshot: FAILED (%s)\n", job->err);
+			else
+				logf("stereo screenshot: written %s, %s, %s, %s%s%s\n", job->files.stereo, job->files.preview,
+				     job->files.jps, job->files.mpo, job->files.anaglyph[0] ? ", " : "", job->files.anaglyph);
+			if (job->ok && job->steam && m_shotsApi && m_addVRShot) {
+				ScreenshotHandle hnd = m_addVRShot(m_shotsApi, k_EVRScreenshotType_Stereo, job->files.preview, job->files.stereo);
+				if (hnd != INVALID_SCREENSHOT_HANDLE && m_setLocation)
+					m_setLocation(m_shotsApi, hnd, job->location);
+				logf("stereo screenshot: Steam library %s (handle %u)\n",
+				     hnd != INVALID_SCREENSHOT_HANDLE ? "added as a stereo screenshot" : "REFUSED it", (unsigned)hnd);
+			}
+			delete job;
+		}
+	}
+
+	// Where the HUD sheet goes in an eye's area (its half of the frame, or a
+	// whole eye in a stereo screenshot). A television is not a headset: the
+	// HUD fills the screen as in 2D, at the same place in both eyes, so it
+	// sits on the screen plane (zero parallax). The client's own placement
+	// (ndc, a floating panel sized for a headset) covered only the middle
+	// (Daniel, 2026-09-24). The sheet is 4:3; keep that shape: full height,
+	// centred.
+	void hud_rect(int hx, int hy, int hw, int hh, int *x0, int *y0, int *x1, int *y1)
+	{
+		double wf = g_cfg.hudwide ? 1.0 : (4.0 / 3.0) / g_cfg.aspect;
+		if (wf > 1.0)
+			wf = 1.0;
+		*x0 = hx + (int)(hw * (1.0 - wf) / 2.0);
+		*x1 = *x0 + (int)(hw * wf);
+		*y0 = hy;
+		*y1 = hy + hh;
+	}
+	// Paints the HUD sheet (and the module's crosshair, for clients that do
+	// not place their own) into the current target at x0, y0, w by h.
+	void paint_hud(IMatRenderContext *ctx, IMaterial *mat, ITexture *sheet, int x0, int y0, int w, int h, bool translucent)
+	{
+		int tw = sheet->GetActualWidth(), th = sheet->GetActualHeight();
+		// The client passes translucent = false while the mouse cursor is
+		// visible: a menu or dialog is open. Those keep HL2's layout (moving
+		// the bottom band sent Save/Cancel to the top; Daniel, 2026-09-24).
+		if (g_cfg.hudband > 0 && translucent) {
+			// HL2 keeps health and ammo in the bottom band, where the ammo
+			// panel lands over the gun, which in 3D is confusing and tiring
+			// (Daniel, 2026-09-24). That band goes to the top and the rest of
+			// the sheet moves down by the band's height, whole (swapping the
+			// two bands cut the weapon selection, drawn at the top, in two).
+			int sb = (int)(th * g_cfg.hudband), db = (int)(h * g_cfg.hudband);
+			ctx->DrawScreenSpaceRectangle(mat, x0, y0 + db, w, h - db, 0, 0, tw - 1, th - sb - 1, tw, th);
+			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, db, 0, th - sb, tw - 1, th - 1, tw, th);
+		} else
+			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, h, 0, 0, tw - 1, th - 1, tw, th);
+		if (g_cfg.xhair && !m_clientCrosshair)
+			draw_crosshair(ctx, x0, y0, w, h);
 	}
 
 	bool composite_eye(VREye eye, float ndc[4], bool translucent)
@@ -838,19 +1162,9 @@ public:
 			base->SetTextureValue(sheet);
 		int hx, hy, hw, hh;
 		half(eye, &hx, &hy, &hw, &hh);
-		// A television is not a headset: the HUD fills the screen as in 2D,
-		// at the same place in both eyes, so it sits on the screen plane
-		// (zero parallax). The client's own placement (ndc, a floating panel
-		// sized for a headset) covered only the middle (Daniel, 2026-09-24).
-		// The sheet is 4:3; keep that shape: full height, centred.
 		(void)ndc;
-		double wf = g_cfg.hudwide ? 1.0 : (4.0 / 3.0) / g_cfg.aspect;
-		if (wf > 1.0)
-			wf = 1.0;
-		int x0 = hx + (int)(hw * (1.0 - wf) / 2.0);
-		int x1 = x0 + (int)(hw * wf);
-		int y0 = hy;
-		int y1 = hy + hh;
+		int x0, y0, x1, y1;
+		hud_rect(hx, hy, hw, hh, &x0, &y0, &x1, &y1);
 		if (m_hudLogs < 4) {
 			m_hudLogs++;
 			ITexture *after = (found && base) ? base->GetTextureValue() : NULL;
@@ -877,24 +1191,12 @@ public:
 		int fw, fh;
 		frame_size(&fw, &fh);
 		ctx->PushRenderTargetAndViewport(NULL, 0, 0, fw, fh);
-		int w = x1 - x0, h = y1 - y0;
-		// The client passes translucent = false while the mouse cursor is
-		// visible: a menu or dialog is open. Those keep HL2's layout (moving
-		// the bottom band sent Save/Cancel to the top; Daniel, 2026-09-24).
-		if (g_cfg.hudband > 0 && translucent) {
-			// HL2 keeps health and ammo in the bottom band, where the ammo
-			// panel lands over the gun, which in 3D is confusing and tiring
-			// (Daniel, 2026-09-24). That band goes to the top and the rest of
-			// the sheet moves down by the band's height, whole (swapping the
-			// two bands cut the weapon selection, drawn at the top, in two).
-			int sb = (int)(th * g_cfg.hudband), db = (int)(h * g_cfg.hudband);
-			ctx->DrawScreenSpaceRectangle(mat, x0, y0 + db, w, h - db, 0, 0, tw - 1, th - sb - 1, tw, th);
-			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, db, 0, th - sb, tw - 1, th - 1, tw, th);
-		} else
-			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, h, 0, 0, tw - 1, th - 1, tw, th);
-		if (g_cfg.xhair && !m_clientCrosshair)
-			draw_crosshair(ctx, x0, y0, w, h);
+		paint_hud(ctx, mat, sheet, x0, y0, x1 - x0, y1 - y0, translucent);
 		ctx->PopRenderTargetAndViewport();
+		// What a stereo screenshot paints over each eye: this frame's HUD.
+		m_hudMatUsed = mat;
+		m_hudSheetUsed = sheet;
+		m_hudTranslucent = translucent;
 		if (g_cfg.dump && m_frame == g_cfg.dump) {
 			if (eye == VREye_Left)
 				dump(ctx, sheet, "svrtv-hud.tga");
@@ -2080,6 +2382,7 @@ public:
 			if (m_targets[i].w == w && m_targets[i].h == h) {
 				m_rt[0] = m_targets[i].rt[0];
 				m_rt[1] = m_targets[i].rt[1];
+				m_shotRT = m_targets[i].shot;
 				return true;
 			}
 		return false;
@@ -2100,6 +2403,15 @@ public:
 			logf("render target %s: %dx%d made\n", name,
 			     m_rt[i] ? m_rt[i]->GetActualWidth() : 0, m_rt[i] ? m_rt[i]->GetActualHeight() : 0);
 		}
+		m_shotRT = NULL;
+		if (g_cfg.shots && m_rt[0] && m_rt[1]) {
+			char name[64];
+			snprintf(name, sizeof(name), "_rt_svrtv_shot_%dx%d", w, h);
+			m_shotRT = ms->CreateNamedRenderTargetTextureEx(name, w, h, RT_SIZE_LITERAL,
+				ms->GetBackBufferFormat(), MATERIAL_RT_DEPTH_NONE,
+				0x4 | 0x8 | 0x100 | 0x200, 0);
+			logf("render target %s: %s\n", name, m_shotRT ? "made" : "NOT made");
+		}
 		if (!m_rt[0] || !m_rt[1])
 			m_rt[0] = m_rt[1] = NULL;
 		else if (m_nTargets < MAX_TARGETS) {
@@ -2107,6 +2419,7 @@ public:
 			m_targets[m_nTargets].h = h;
 			m_targets[m_nTargets].rt[0] = m_rt[0];
 			m_targets[m_nTargets].rt[1] = m_rt[1];
+			m_targets[m_nTargets].shot = m_shotRT;
 			m_nTargets++;
 		}
 		if (m_uiMade)
@@ -2151,6 +2464,7 @@ public:
 	{
 		trace(3, "ShutdownRenderTargets");
 		m_rt[0] = m_rt[1] = NULL;
+		m_shotRT = NULL;
 		m_nTargets = 0;
 	}
 	ITexture *GetRenderTarget(VREye eye, EWhichRenderTarget which)
@@ -2191,12 +2505,14 @@ public:
 		frame_mode_on();
 		apply_output();
 		m_loadingDirty = true;   // the native loading pictures for this packing
+		shots_hook(true);
 		return true;
 	}
 	void Deactivate()
 	{
 		m_active = false;
 		logf("deactivated\n");
+		shots_hook(false);
 		m_uiFull = false;
 		confine_mouse(false);
 		clear_output();
@@ -2312,7 +2628,7 @@ private:
 	CreateInterfaceFn m_factory;
 	bool m_triedTargets;
 	enum { MAX_TARGETS = 8 };
-	struct EyeTargets { int w, h; ITexture *rt[2]; };
+	struct EyeTargets { int w, h; ITexture *rt[2]; ITexture *shot; };
 	EyeTargets m_targets[MAX_TARGETS];   // one pair per eye size
 	int m_nTargets;
 	bool m_uiMade;              // HUD sheets made (shared by both layouts)
@@ -2328,6 +2644,19 @@ private:
 	int m_modeCheckFrame;       // the frame at which to log whether the frame mode was granted (0: none)
 	int m_relayout;             // Apply while on: the format + 1 to activate again with, in Deactivate()
 	ITexture *m_rt[2];
+	ITexture *m_shotRT;         // eye-sized: where a stereo screenshot gets its HUD
+	IMaterial *m_hudMatUsed;    // this frame's HUD paste, repeated in a screenshot
+	ITexture *m_hudSheetUsed;
+	bool m_hudTranslucent;
+	bool m_engineShot;          // the engine was taking a screenshot last frame
+	bool m_steamLooked;
+	void *m_steamLib;
+	ISteamScreenshots *m_shotsApi;
+	HookScreenshotsFn m_hookShots;
+	AddVRScreenshotFn m_addVRShot;
+	SetLocationFn m_setLocation;
+	UnregisterCallbackFn m_unregister;
+	bool m_shotsHooked;         // Steam's screenshot key is the module's
 	bool m_shown[2];
 	bool m_traced[8];
 	int m_hudLogs;

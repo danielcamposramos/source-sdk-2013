@@ -25,12 +25,15 @@ $Project "sourcevr_display"
 	$Folder	"Source Files"
 	{
 		$File	"sourcevr_display.cpp"
+		$File	"stereo_shot.cpp"
 	}
 
 	$Folder	"Header Files"
 	{
 		$File	"$SRCDIR\public\sourcevr\isourcevirtualreality.h"
 		$File	"$SRCDIR\public\sourcevr\isourcevrdisplay.h"
+		$File	"stereo_shot.h"
+		$File	"$SRCDIR\thirdparty\stb\stb_image_write.h"
 	}
 
 	$Folder	"Link Libraries"
