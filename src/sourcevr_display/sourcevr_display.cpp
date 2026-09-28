@@ -29,6 +29,8 @@
 //   SVRTV_ANGLELOG     1 records the engine's view angles and a timestamp for
 //                      every frame, in memory, written to svrtv-angles.tsv next
 //                      to this module when the game exits (diagnostics)
+//   SVRTV_LOADINGSCREEN 0 leaves loading screens inside gamescope as the game
+//                      draws them (default 1: whole in both eyes)
 //   SVRTV_CALLTRACE    1 logs every gap over 200 ms between the calls the
 //                      module receives, and the calls made while the engine
 //                      draws its loading image (diagnostics)
@@ -128,6 +130,7 @@ struct Config {
 	bool latecopy;    // both eyes into the frame together at the end of the frame
 	int dumpevery;    // diagnostics: after SVRTV_DUMP, a frame every n frames
 	bool calltrace;   // diagnostics: log the gaps between the calls the module receives
+	bool loading;     // gamescope: frames marked, loading screens whole in both eyes
 	bool xhair;       // the module draws the crosshair on the 2D layer (client's off)
 	bool bluroff;     // motion blur off while VR is on, the player's setting restored after
 	int aniso;        // mat_forceaniso while VR is on (0 leaves it), the player's setting restored after
@@ -416,6 +419,9 @@ void load_config()
 	// receives, and the calls made while the engine draws its loading
 	// image (does the module get any frame during a load?).
 	g_cfg.calltrace = env_double("SVRTV_CALLTRACE", 0) != 0;
+	// Loading screens inside gamescope (see mark_frame); 0 leaves them as the
+	// game draws them.
+	g_cfg.loading = env_double("SVRTV_LOADINGSCREEN", 1) != 0;
 	// Source keeps motion blur's previous view in statics shared by both eyes
 	// (viewpostprocess.cpp), so in stereo each eye blurs differently during a
 	// turn; with it on, the mouse felt wrecked (Daniel, run p20, 2026-09-26).
@@ -719,13 +725,45 @@ public:
 	{
 		beat("CompositeHud");
 		trace(1, "CompositeHud");
+		bool ok;
 		if (!g_cfg.latecopy)
-			return composite_eye(eye, ndc, translucent);
-		if (eye == VREye_Left)
+			ok = composite_eye(eye, ndc, translucent);
+		else if (eye == VREye_Left)
 			return true;
-		m_shown[0] = m_shown[1] = false;
-		composite_eye(VREye_Left, ndc, translucent);
-		return composite_eye(VREye_Right, ndc, translucent);
+		else {
+			m_shown[0] = m_shown[1] = false;
+			composite_eye(VREye_Left, ndc, translucent);
+			ok = composite_eye(VREye_Right, ndc, translucent);
+		}
+		if (eye == VREye_Right)
+			mark_frame();
+		return ok;
+	}
+
+	// Loading screens (Daniel, 2026-09-28): the engine draws them while no
+	// view renders, straight to the screen, once across the whole frame
+	// (run q28), so each eye got half of one flat image, spinner and progress
+	// bar included (ghosts in top and bottom, a clash in side by side).
+	// Natively nothing reaches the module then; inside gamescope every frame
+	// passes through its effect. So there, every frame the module builds
+	// carries a mark, its two bottom-right pixels green then magenta, and the
+	// effect (svrtv-anaglyph.fx) puts any frame without it, flat 2D, whole
+	// into both halves, and paints the mark over.
+	void mark_frame()
+	{
+		if (!g_cfg.loading || !in_gamescope() || !m_ms)
+			return;
+		int fw, fh;
+		frame_size(&fw, &fh);
+		CMatRenderContextPtr ctx(m_ms);
+		ctx->PushRenderTargetAndViewport(NULL, fw - 2, fh - 1, 1, 1);
+		ctx->ClearColor4ub(0, 255, 0, 255);
+		ctx->ClearBuffers(true, false);
+		ctx->PopRenderTargetAndViewport();
+		ctx->PushRenderTargetAndViewport(NULL, fw - 1, fh - 1, 1, 1);
+		ctx->ClearColor4ub(255, 0, 255, 255);
+		ctx->ClearBuffers(true, false);
+		ctx->PopRenderTargetAndViewport();
 	}
 
 	bool composite_eye(VREye eye, float ndc[4], bool translucent)
@@ -1163,14 +1201,16 @@ public:
 				command("echo \"3D output: this output needs gamescope; showing the 3D display format instead\"");
 			return;
 		}
-		if (out == 0) {
+		if (out == 0 && !g_cfg.loading) {
 			if (m_effectSet)
 				gamescope_effect(-1);
 			return;
 		}
 		// svrtv-anaglyph.fx techniques, from side by side / from top and bottom.
 		// The full formats pack into the same screen, so they use the same ones.
-		static const int techniques[OUT_COUNT][2] = { { -1, -1 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
+		// The 3D display itself gets 10/9: the frames as they are, loading
+		// screens whole in both halves (mark_frame).
+		static const int techniques[OUT_COUNT][2] = { { 10, 9 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
 		gamescope_effect(techniques[out][packed_tab() ? 1 : 0]);
 	}
 	void clear_output()
