@@ -28,7 +28,9 @@
 
 				"options"
 				{
-					"1"		"Top and bottom (recommended)"
+					"2"		"Top and bottom, full (recommended)"
+					"3"		"Side by side, full"
+					"1"		"Top and bottom"
 					"0"		"Side by side"
 				}
 			}
@@ -42,10 +44,10 @@
 
 				"options"
 				{
-					"1"		"Top and bottom (recommended)"
-					"0"		"Side by side"
-					"2"		"Top and bottom, full"
+					"2"		"Top and bottom, full (recommended)"
 					"3"		"Side by side, full"
+					"1"		"Top and bottom"
+					"0"		"Side by side"
 				}
 			}
 

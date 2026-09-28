@@ -431,8 +431,8 @@ static ConVar vr_display_3d("vr_display_3d", "0", FCVAR_ARCHIVE,
 	true, 0, true, 1, display_changed);
 // Top and bottom by default: each eye keeps the full width, the axis stereo
 // depth lives on (Daniel's choice, 2026-09-26).
-static ConVar vr_display_layout("vr_display_layout", "1", FCVAR_ARCHIVE,
-	"3D format: 1 top and bottom (recommended), 0 side by side, 2 top and bottom full, 3 side by side full, 4 frame packing 1080p, 5 frame packing 720p",
+static ConVar vr_display_layout("vr_display_layout", "2", FCVAR_ARCHIVE,
+	"3D format: 2 top and bottom full (recommended: full-size eyes, supersampled), 3 side by side full, 1 top and bottom, 0 side by side (lighter), 4 frame packing 1080p, 5 frame packing 720p",
 	true, 0, true, FMT_COUNT - 1, display_changed);
 static ConVar vr_display_output("vr_display_output", "0", FCVAR_ARCHIVE,
 	"3D output: 0 the 3D display, 1 red/cyan anaglyph for CRTs, 2 red/cyan anaglyph for modern screens, 3 row-interleaved (passive screens), 4 checkerboard (DLP)",
