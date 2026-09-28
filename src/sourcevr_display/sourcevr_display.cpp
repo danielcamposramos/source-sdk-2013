@@ -29,8 +29,9 @@
 //   SVRTV_ANGLELOG     1 records the engine's view angles and a timestamp for
 //                      every frame, in memory, written to svrtv-angles.tsv next
 //                      to this module when the game exits (diagnostics)
-//   SVRTV_LOADINGSCREEN 0 leaves loading screens inside gamescope as the game
-//                      draws them (default 1: whole in both eyes)
+//   SVRTV_LOADINGSCREEN 0 leaves loading screens as the game draws them
+//                      (default 1: whole in both eyes inside gamescope,
+//                      stereo art natively)
 //   SVRTV_CALLTRACE    1 logs every gap over 200 ms between the calls the
 //                      module receives, and the calls made while the engine
 //                      draws its loading image (diagnostics)
@@ -67,6 +68,7 @@
 #include "vgui/ISurface.h"
 #ifdef _WIN32
 #include "winlite.h"
+#include <direct.h>
 #else
 #include <dlfcn.h>
 #include <sys/time.h>
@@ -419,8 +421,9 @@ void load_config()
 	// receives, and the calls made while the engine draws its loading
 	// image (does the module get any frame during a load?).
 	g_cfg.calltrace = env_double("SVRTV_CALLTRACE", 0) != 0;
-	// Loading screens inside gamescope (see mark_frame); 0 leaves them as the
-	// game draws them.
+	// Loading screens: whole in both eyes inside gamescope (mark_frame),
+	// stereo art natively (loading_startup); 0 leaves them as the game draws
+	// them.
 	g_cfg.loading = env_double("SVRTV_LOADINGSCREEN", 1) != 0;
 	// Source keeps motion blur's previous view in statics shared by both eyes
 	// (viewpostprocess.cpp), so in stereo each eye blurs differently during a
@@ -541,6 +544,10 @@ public:
 		m_xdpy = NULL;
 		m_uiMade = false;
 		m_nTargets = 0;
+		m_loadingRT = NULL;
+		for (int i = 0; i <= LOADING_BGS; i++)
+			m_loadingMat[i] = NULL;
+		m_loadingDirty = false;
 	}
 
 	// IAppSystem
@@ -555,6 +562,12 @@ public:
 		bool gamescope = getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL;
 		vr_display_gamescope.SetValue(gamescope ? 1 : 0);
 		vr_display_native.SetValue(gamescope ? 0 : 1);
+		// Loading screens: the files GameUI reads once, at start-up, set now
+		// for the state the game starts in; the source materials (re)written.
+		if (g_cfg.loading && loading_available()) {
+			loading_sources();
+			loading_startup();
+		}
 		return true;
 	}
 	void Disconnect()
@@ -707,6 +720,8 @@ public:
 	{
 		beat("DoDistortionProcessing");
 		trace(0, "DoDistortionProcessing");
+		if (eye == VREye_Left)
+			loading_update();
 		if (!g_cfg.latecopy)
 			show(eye);
 		return true;
@@ -1139,6 +1154,309 @@ public:
 	}
 	// gamescope finds effects in its ReShade folder; the module brings its
 	// own copy from next to itself.
+	// Loading screens, natively (Daniel, 2026-09-28: stereo art only). The
+	// engine draws the loading screen once across the whole frame while no
+	// view renders (run q28), and natively nothing reaches the module then.
+	// GameUI builds it from the chapter's picture, named in
+	// scripts/chapterbackgrounds.txt, plus a spinner and a progress bar, and
+	// reads the list and the colours once, at start-up (runs q30-q32). So:
+	// - while 3D runs, the module saves a stereo copy of each picture beside
+	//   the originals (console/svrtv1_tab_<name> or svrtv1_sbs_<name>, drawn
+	//   by the game's renderer and read back): the picture once per eye in
+	//   the frame's packing, and the game's lambda logo at the centre, half
+	//   the largest centred square, popped in front of the screen;
+	// - at start-up, when the game will start in 3D and the copies for its
+	//   packing exist, a chapter list in the 3D menu's custom folder points
+	//   at them; otherwise it goes, and the loading screens are Valve's.
+	// GameUI's spinner and progress bar are still drawn once across the frame
+	// (run q34: the spinner in one eye's corner, the bar crossing from one
+	// eye into the other, no ghost; hiding them through the client scheme
+	// did not reach them). Daniel: acceptable, loading screens are a small
+	// part of the time next to the whole game in depth.
+	// Valve's files are never touched. A 3D or format change during a session
+	// reaches the loading screens at the next start. Inside gamescope none of
+	// this: the effect puts the whole loading screen into both eyes
+	// (mark_frame).
+	enum { LOADING_BGS = 7, LOADING_W = 2048, LOADING_H = 1024 };
+	void loading_path(char *out, size_t n, const char *sub)
+	{
+		snprintf(out, n, "%s../hl2/custom/svrtv-3d-menu/%s", g_dir, sub);
+	}
+	bool loading_file(const char *sub)
+	{
+		char p[1200];
+		loading_path(p, sizeof(p), sub);
+		FILE *f = fopen(p, "rb");
+		if (!f)
+			return false;
+		fclose(f);
+		return true;
+	}
+	bool loading_available() { return loading_file("gamepadui/options.res"); }
+	static void make_dirs(char *path)   // every folder of a file's path
+	{
+		for (char *c = path + 1; *c; c++)
+			if (*c == '/' || *c == '\\') {
+				char k = *c;
+				*c = 0;
+#ifdef _WIN32
+				_mkdir(path);
+#else
+				mkdir(path, 0755);
+#endif
+				*c = k;
+			}
+	}
+	void loading_write(const char *sub, const char *text)
+	{
+		char p[1200];
+		loading_path(p, sizeof(p), sub);
+		make_dirs(p);
+		FILE *f = fopen(p, "w");
+		if (f) {
+			fputs(text, f);
+			fclose(f);
+		}
+	}
+	// An uncompressed BGRA8888 VTF (7.1, one level) from read-back pixels.
+	void loading_vtf(const char *sub, const unsigned char *px, int w, int h)
+	{
+		char p[1200];
+		loading_path(p, sizeof(p), sub);
+		make_dirs(p);
+		FILE *f = fopen(p, "wb");
+		if (!f)
+			return;
+		unsigned char hdr[64];
+		memset(hdr, 0, sizeof(hdr));
+		unsigned int u;
+		unsigned short s;
+		float one = 1.0f;
+		memcpy(hdr, "VTF", 4);
+		u = 7; memcpy(hdr + 4, &u, 4);
+		u = 1; memcpy(hdr + 8, &u, 4);
+		u = 64; memcpy(hdr + 12, &u, 4);       // header size
+		s = (unsigned short)w; memcpy(hdr + 16, &s, 2);
+		s = (unsigned short)h; memcpy(hdr + 18, &s, 2);
+		u = 0x4 | 0x8 | 0x100 | 0x200; memcpy(hdr + 20, &u, 4);   // CLAMPS|CLAMPT|NOMIP|NOLOD
+		s = 1; memcpy(hdr + 24, &s, 2);        // frames
+		memcpy(hdr + 48, &one, 4);             // bump map scale
+		u = IMAGE_FORMAT_BGRA8888; memcpy(hdr + 52, &u, 4);
+		hdr[56] = 1;                           // mip levels
+		u = 0xFFFFFFFF; memcpy(hdr + 57, &u, 4);   // no low-resolution image
+		fwrite(hdr, 1, sizeof(hdr), f);
+		fwrite(px, 1, (size_t)w * h * 4, f);
+		fclose(f);
+	}
+	static const char *loading_prefix(int pk) { return pk == FMT_SBS ? "svrtv1_sbs_" : "svrtv1_tab_"; }
+	bool loading_ready(const char *prefix)
+	{
+		for (int i = 1; i <= LOADING_BGS; i++) {
+			char sub[160];
+			snprintf(sub, sizeof(sub), "materials/console/%sbackground%02d_widescreen.vtf", prefix, i);
+			if (!loading_file(sub))
+				return false;
+		}
+		return true;
+	}
+	// The chapter list: Valve's, each background renamed to its stereo copy;
+	// NULL removes it.
+	void loading_chapters(const char *prefix)
+	{
+		char dst[1200];
+		loading_path(dst, sizeof(dst), "scripts/chapterbackgrounds.txt");
+		if (!prefix) {
+			if (remove(dst) == 0)
+				logf("loading screens: chapter list removed (Valve's pictures)\n");
+			return;
+		}
+		char src[1200];
+		snprintf(src, sizeof(src), "%s../hl2/scripts/chapterbackgrounds.txt", g_dir);
+		FILE *in = fopen(src, "r");
+		if (!in) {
+			logf("loading screens: %s not found\n", src);
+			return;
+		}
+		make_dirs(dst);
+		FILE *out = fopen(dst, "w");
+		if (!out) {
+			fclose(in);
+			return;
+		}
+		char line[512];
+		while (fgets(line, sizeof(line), in)) {
+			char *b = strstr(line, "\"background");
+			if (b) {
+				fwrite(line, 1, b + 1 - line, out);
+				fputs(prefix, out);
+				fputs(b + 1, out);
+			} else
+				fputs(line, out);
+		}
+		fclose(in);
+		fclose(out);
+		logf("loading screens: chapter list points at the %s pictures\n", prefix);
+	}
+	// "9" from a line like: vr_display_3d "9"
+	static int saved_int(const char *text, const char *name, int def)
+	{
+		const char *p = text;
+		size_t n = strlen(name);
+		while ((p = strstr(p, name)) != NULL) {
+			if ((p == text || p[-1] == '\n') && (p[n] == ' ' || p[n] == '\t')) {
+				const char *q = strchr(p + n, '"');
+				if (q)
+					return atoi(q + 1);
+			}
+			p += n;
+		}
+		return def;
+	}
+	// At start-up (Connect, before the game reads its files): the stereo art
+	// when the game will start in 3D, natively, in a packing whose copies
+	// exist; Valve's loading screens otherwise.
+	void loading_startup()
+	{
+		// The game's folder from the launch line (-game, relative to the game's
+		// root or absolute): at Connect the engine has not set its own yet.
+		char gamedir[1024];
+		const char *game = CommandLine()->ParmValue("-game", "hl2");
+		bool absolute = game[0] == '/' || game[0] == '\\' || (game[0] && game[1] == ':');
+		if (absolute)
+			snprintf(gamedir, sizeof(gamedir), "%s", game);
+		else
+			snprintf(gamedir, sizeof(gamedir), "%s../%s", g_dir, game);
+		bool on = g_cfg.enabled;
+		int fmt = g_cfg.layoutGiven ? g_cfg.format : FMT_TAB_FULL;
+		char cfg[1200];
+		snprintf(cfg, sizeof(cfg), "%s/cfg/config.cfg", gamedir);
+		FILE *f = fopen(cfg, "rb");
+		if (f) {
+			static char text[262144];
+			size_t n = fread(text, 1, sizeof(text) - 1, f);
+			text[n] = 0;
+			fclose(f);
+			on = on || saved_int(text, "vr_display_3d", 0) > 0;
+			if (!g_cfg.layoutGiven)
+				fmt = saved_int(text, "vr_display_layout", FMT_TAB_FULL);
+			logf("loading screens: saved state from %s: 3D %d, format %d\n", cfg, (int)on, fmt);
+		} else
+			logf("loading screens: no saved state (%s)\n", cfg);
+		int pk = fmt == FMT_TAB || fmt == FMT_TAB_FULL ? FMT_TAB : fmt == FMT_SBS || fmt == FMT_SBS_FULL ? FMT_SBS : -1;
+		const char *prefix = pk >= 0 ? loading_prefix(pk) : NULL;
+		if (on && prefix && !in_gamescope() && loading_ready(prefix))
+			loading_chapters(prefix);
+		else {
+			loading_chapters(NULL);
+			logf("loading screens: Valve's (3D at start %d, packing %d, gamescope %d)\n", (int)on, pk, (int)in_gamescope());
+		}
+	}
+	IMaterial *loading_material(int i)   // 0..6 the pictures, LOADING_BGS the logo
+	{
+		if (!m_loadingMat[i]) {
+			char name[64];
+			if (i < LOADING_BGS)
+				snprintf(name, sizeof(name), "svrtv/loading_bg%02d", i + 1);
+			else
+				snprintf(name, sizeof(name), "svrtv/loading_logo");
+			IMaterial *m = m_ms->FindMaterial(name, TEXTURE_GROUP_VGUI, false);
+			if (!m || m->IsErrorMaterial())
+				return NULL;
+			m->IncrementReferenceCount();
+			m_loadingMat[i] = m;
+		}
+		return m_loadingMat[i];
+	}
+	// Draws and saves every picture of this packing that has no stereo copy
+	// yet (a name's content never changes: the version is in the prefix),
+	// for the next start.
+	void loading_make()
+	{
+		if (!m_loadingRT || !m_ms)
+			return;
+		int pk = packing();
+		if (pk != FMT_TAB && pk != FMT_SBS)
+			return;
+		const char *prefix = loading_prefix(pk);
+		// The eye's own view, normalised: the logo's box and its shift
+		// (crossed parallax: the left eye's copy right, the right eye's left).
+		float sw = (float)g_cfg.width, sh = (float)g_cfg.height, side = 0.5f * (sw < sh ? sw : sh);
+		float lw = side / sw, lh = side / sh, pop = 0.00625f;
+		IMaterial *logo = loading_material(LOADING_BGS);
+		unsigned char *px = NULL;
+		int made = 0, kept = 0;
+		for (int i = 0; i < LOADING_BGS; i++) {
+			char sub[160], text[512];
+			snprintf(sub, sizeof(sub), "materials/console/%sbackground%02d_widescreen.vtf", prefix, i + 1);
+			if (loading_file(sub)) {
+				kept++;
+				continue;
+			}
+			IMaterial *bg = loading_material(i);
+			if (!bg)
+				continue;
+			if (!px && !(px = (unsigned char *)malloc((size_t)LOADING_W * LOADING_H * 4)))
+				break;
+			CMatRenderContextPtr ctx(m_ms);
+			ctx->PushRenderTargetAndViewport(m_loadingRT, 0, 0, LOADING_W, LOADING_H);
+			ctx->ClearColor4ub(0, 0, 0, 255);
+			ctx->ClearBuffers(true, false);
+			for (int half = 0; half < 2; half++) {
+				int hx = 0, hy = 0, hw = LOADING_W, hh = LOADING_H;
+				if (pk == FMT_TAB) { hh = LOADING_H / 2; hy = half * hh; }
+				else { hw = LOADING_W / 2; hx = half * hw; }
+				ctx->DrawScreenSpaceRectangle(bg, hx, hy, hw, hh, 0, 0, 511, 511, 512, 512);
+				if (logo) {
+					bool left = (half == 0) != g_cfg.swap;   // the first place is the left eye unless swapped
+					float x = 0.5f - lw / 2 + (left ? pop : -pop), y = 0.5f - lh / 2;
+					ctx->DrawScreenSpaceRectangle(logo, hx + (int)(x * hw), hy + (int)(y * hh),
+						(int)(lw * hw), (int)(lh * hh), 0, 0, 255, 255, 256, 256);
+				}
+			}
+			ctx->ReadPixels(0, 0, LOADING_W, LOADING_H, px, IMAGE_FORMAT_BGRA8888);
+			ctx->PopRenderTargetAndViewport();
+			for (size_t k = 3; k < (size_t)LOADING_W * LOADING_H * 4; k += 4)
+				px[k] = 255;
+			loading_vtf(sub, px, LOADING_W, LOADING_H);
+			for (int wide = 0; wide < 2; wide++) {
+				snprintf(sub, sizeof(sub), "materials/console/%sbackground%02d%s.vmt", prefix, i + 1, wide ? "_widescreen" : "");
+				snprintf(text, sizeof(text),
+					"\"UnlitGeneric\"\n{\n\t\"$basetexture\" \"console/%sbackground%02d_widescreen\"\n\t\"$vertexcolor\" 1\n"
+					"\t\"$vertexalpha\" 1\n\t\"$ignorez\" 1\n\t\"$no_fullbright\" 1\n\t\"$nolod\" 1\n}\n", prefix, i + 1);
+				loading_write(sub, text);
+			}
+			made++;
+		}
+		free(px);
+		logf("loading screens: %d stereo pictures made, %d already there (%s)\n", made, kept, prefix);
+	}
+	// The materials the module draws from: the chapter pictures under their
+	// own names and the logo.
+	void loading_sources()
+	{
+		for (int i = 1; i <= LOADING_BGS; i++) {
+			char sub[128], text[512];
+			snprintf(sub, sizeof(sub), "materials/svrtv/loading_bg%02d.vmt", i);
+			snprintf(text, sizeof(text),
+				"\"UnlitGeneric\"\n{\n\t\"$basetexture\" \"console/background%02d_widescreen\"\n"
+				"\t\"$ignorez\" 1\n\t\"$nolod\" 1\n\t\"$nomip\" 1\n}\n", i);
+			loading_write(sub, text);
+		}
+		loading_write("materials/svrtv/loading_logo.vmt",
+			"\"UnlitGeneric\"\n{\n\t\"$basetexture\" \"gamepadui/game_logo\"\n\t\"$translucent\" 1\n"
+			"\t\"$ignorez\" 1\n\t\"$nomip\" 1\n}\n");
+	}
+	// From the eyes' first call in a frame, once after 3D starts natively: the
+	// copies for this packing, for the next start.
+	void loading_update()
+	{
+		if (!g_cfg.loading || !m_loadingRT || !m_loadingDirty)
+			return;
+		m_loadingDirty = false;
+		if (!in_gamescope())
+			loading_make();
+	}
+
 	void install_effect()
 	{
 #ifndef _WIN32
@@ -1820,6 +2138,14 @@ public:
 			0x4 | 0x8 | 0x100 | 0x200, 0);
 		logf("render target _rt_svrtv_gui: made %dx%d\n",
 		     m_hud ? m_hud->GetActualWidth() : 0, m_hud ? m_hud->GetActualHeight() : 0);
+
+		// Where the native loading screens' stereo pictures are drawn.
+		if (g_cfg.loading && !in_gamescope() && loading_available()) {
+			m_loadingRT = ms->CreateNamedRenderTargetTextureEx("_rt_svrtv_loading", LOADING_W, LOADING_H, RT_SIZE_LITERAL,
+				ms->GetBackBufferFormat(), MATERIAL_RT_DEPTH_NONE,
+				0x4 | 0x8 | 0x100 | 0x200, 0);
+			logf("loading screens: target %dx%d %s\n", LOADING_W, LOADING_H, m_loadingRT ? "made" : "NOT made");
+		}
 	}
 	void ShutdownRenderTargets()
 	{
@@ -1864,6 +2190,7 @@ public:
 		launch_3d_mark();
 		frame_mode_on();
 		apply_output();
+		m_loadingDirty = true;   // the native loading pictures for this packing
 		return true;
 	}
 	void Deactivate()
@@ -1975,6 +2302,9 @@ private:
 
 	bool m_active;
 	bool m_clientCrosshair;   // the client places the crosshair (it asked for the display interface)
+	ITexture *m_loadingRT;
+	IMaterial *m_loadingMat[LOADING_BGS + 1];
+	bool m_loadingDirty;   // the native loading pictures to make
 	double m_lastCall, m_lastLoadingLog;   // SVRTV_CALLTRACE
 	const char *m_lastWhat;
 	float m_fovX;
