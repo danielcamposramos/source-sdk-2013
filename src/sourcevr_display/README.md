@@ -16,6 +16,14 @@ Played on a Sony KDL-46HX855 over HDMI, Half-Life 2 (native Linux, Vulkan), NVID
 - Swap eyes; the menus and HUD at full size, at zero depth; the launch option `-stereo3d`.
 - While 3D is on, the module turns motion blur off (its previous-frame state is shared by both eyes and smears differently in each) and sets anisotropic filtering to 16x; the player's own values come back when 3D ends, or at the next start if the game quit in 3D.
 
+## Spectating in 3D (SourceTV and the observer cameras)
+
+Stereo is the 2D game with a second camera. Every view the game already has goes through the same VR path, so every one gets its second eye with no map or game changes: the player's own view, the spectator's in-eye, chase and free cameras, the cameras mappers place (`info_observer_point`), SourceTV's director, scripted cameras (`point_viewcontrol`). The game's own rules still decide what is drawn: with this branch's client the crosshair is placed as in 2D, so it shows in first person and in-eye and not in chase or fixed cameras, and the module hands the crosshair back to any client that asks for its display interface (with Valve's shipped clients it keeps drawing its own).
+
+SourceTV transmits the game's state, not video: every viewer's game renders the picture, so one broadcast serves 2D and 3D viewers alike, each in the format they choose.
+
+Tested 2026-09-28 (runs r04-r06, Half-Life 2: Deathmatch built from this branch on Source SDK Base 2013 Multiplayer, 64-bit, native to a 3D TV): the crosshair centred while playing; the spectator's free camera in 3D; a SourceTV demo recorded on a listen server, played back in 3D. That demo stops at the same point in 2D and in 3D with Source's own `Host_Error: CL_PreserveExistingEntity: missing client entity`, a known class of Source demo error, not the stereo. Mapper-placed spectator cameras are not tried yet (the installed map has none).
+
 ## Known failures (and what we are doing about them)
 
 - The full formats reach the TV as supersampled half frames, the only frames a 1080p 3D TV unpacks. A display that takes a larger frame (a 4K passive set, a headset through gamescope's VR overlay) needs the game's screen at that size, which is the next step, with no resize at run time.

@@ -16,6 +16,7 @@
 #include "materialsystem/imaterialsystem.h"
 #include "VGuiMatSurface/IMatSystemSurface.h"
 #include "client_virtualreality.h"
+#include "sourcevr/isourcevrdisplay.h"
 #include "sourcevr/isourcevirtualreality.h"
 
 #ifdef SIXENSE
@@ -165,7 +166,10 @@ void CHudCrosshair::GetDrawPosition ( float *pX, float *pY, bool *pbBehindCamera
 		Vector vecStart;
 		Vector vecEnd;
 
-		if ( UseVR() )
+		// A stereoscopic display shows the HUD as in 2D, on the screen plane,
+		// so the crosshair goes where 2D puts it: the centre, where view and
+		// aim meet. The aim projection below is for a headset's HUD panel.
+		if ( UseVR() && !UseVRDisplay() )
 		{
 			// These are the correct values to use, but they lag the high-speed view data...
 			vecStart = pPlayer->Weapon_ShootPosition();

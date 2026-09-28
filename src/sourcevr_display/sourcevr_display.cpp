@@ -486,7 +486,7 @@ static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
 class CSourceVRTelevision : public ISourceVirtualReality, public ISourceVRDisplay
 {
 public:
-	CSourceVRTelevision() : m_active(false), m_fovX(75.0f), m_ms(NULL), m_factory(NULL), m_triedTargets(false)
+	CSourceVRTelevision() : m_active(false), m_clientCrosshair(false), m_fovX(75.0f), m_ms(NULL), m_factory(NULL), m_triedTargets(false)
 	{
 		m_rt[0] = m_rt[1] = NULL;
 		m_shown[0] = m_shown[1] = false;
@@ -562,7 +562,21 @@ public:
 	// muzzle flash placement). The display is the headset whenever 3D is on:
 	// the spectator mode (a real headset, the display mirroring it) will
 	// answer false here, so the headset keeps its own UI and HUD.
-	bool IsDisplayTheHeadset() { return g_cfg.enabled && m_active; }
+	bool IsDisplayTheHeadset()
+	{
+		bool display = g_cfg.enabled && m_active;
+		// A client that asks this lays its UI out at the window's size and
+		// places its crosshair as in 2D, by the game's own rules: in first
+		// person and in the in-eye spectator view, not in chase or fixed
+		// cameras. The module's own crosshair is only for clients that do
+		// not ask (today's Half-Life 2), so it hands the crosshair back.
+		if (display && !m_clientCrosshair) {
+			m_clientCrosshair = true;
+			crosshair_restore();
+			logf("crosshair: the client's own (display-aware client)\n");
+		}
+		return display;
+	}
 	InitReturnVal_t Init() { return INIT_OK; }
 	void Shutdown() {}
 
@@ -814,7 +828,7 @@ public:
 			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, db, 0, th - sb, tw - 1, th - 1, tw, th);
 		} else
 			ctx->DrawScreenSpaceRectangle(mat, x0, y0, w, h, 0, 0, tw - 1, th - 1, tw, th);
-		if (g_cfg.xhair)
+		if (g_cfg.xhair && !m_clientCrosshair)
 			draw_crosshair(ctx, x0, y0, w, h);
 		ctx->PopRenderTargetAndViewport();
 		if (g_cfg.dump && m_frame == g_cfg.dump) {
@@ -1763,7 +1777,7 @@ public:
 		size_from_mode();
 		logf("activated: %s, %dx%d 2D\n", g_formatNames[g_cfg.format], g_cfg.width, g_cfg.height);
 		command(g_cfg.onvr);
-		if (g_cfg.xhair)
+		if (g_cfg.xhair && !m_clientCrosshair)
 			crosshair_off();
 		if (g_cfg.bluroff)
 			blur_off();
@@ -1882,6 +1896,7 @@ private:
 	}
 
 	bool m_active;
+	bool m_clientCrosshair;   // the client places the crosshair (it asked for the display interface)
 	float m_fovX;
 	IMaterialSystem *m_ms;
 	CreateInterfaceFn m_factory;
