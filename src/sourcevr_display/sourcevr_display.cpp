@@ -29,6 +29,9 @@
 //   SVRTV_ANGLELOG     1 records the engine's view angles and a timestamp for
 //                      every frame, in memory, written to svrtv-angles.tsv next
 //                      to this module when the game exits (diagnostics)
+//   SVRTV_CALLTRACE    1 logs every gap over 200 ms between the calls the
+//                      module receives, and the calls made while the engine
+//                      draws its loading image (diagnostics)
 //
 // In the game, 3D is switched on by any of: -stereo3d on the command line (a
 // launch option, in the saved format; -stereo3d tab|sbs forces one), the saved settings the
@@ -124,6 +127,7 @@ struct Config {
 	int eyew, eyeh;   // eye render size (SVRTV_EYE=WxH); 0: its half of the frame
 	bool latecopy;    // both eyes into the frame together at the end of the frame
 	int dumpevery;    // diagnostics: after SVRTV_DUMP, a frame every n frames
+	bool calltrace;   // diagnostics: log the gaps between the calls the module receives
 	bool xhair;       // the module draws the crosshair on the 2D layer (client's off)
 	bool bluroff;     // motion blur off while VR is on, the player's setting restored after
 	int aniso;        // mat_forceaniso while VR is on (0 leaves it), the player's setting restored after
@@ -408,6 +412,10 @@ void load_config()
 	// off-centre in the eyes, so the module draws HL2's crosshair on the 2D
 	// layer, once per eye (SVRTV_CROSSHAIR=0 leaves the client's).
 	g_cfg.xhair = env_double("SVRTV_CROSSHAIR", 1) != 0;
+	// Diagnostics: every gap over 200 ms between the calls the module
+	// receives, and the calls made while the engine draws its loading
+	// image (does the module get any frame during a load?).
+	g_cfg.calltrace = env_double("SVRTV_CALLTRACE", 0) != 0;
 	// Source keeps motion blur's previous view in statics shared by both eyes
 	// (viewpostprocess.cpp), so in stereo each eye blurs differently during a
 	// turn; with it on, the mouse felt wrecked (Daniel, run p20, 2026-09-26).
@@ -486,7 +494,7 @@ static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
 class CSourceVRTelevision : public ISourceVirtualReality, public ISourceVRDisplay
 {
 public:
-	CSourceVRTelevision() : m_active(false), m_clientCrosshair(false), m_fovX(75.0f), m_ms(NULL), m_factory(NULL), m_triedTargets(false)
+	CSourceVRTelevision() : m_active(false), m_clientCrosshair(false), m_lastCall(0), m_lastLoadingLog(0), m_lastWhat(""), m_fovX(75.0f), m_ms(NULL), m_factory(NULL), m_triedTargets(false)
 	{
 		m_rt[0] = m_rt[1] = NULL;
 		m_shown[0] = m_shown[1] = false;
@@ -583,11 +591,12 @@ public:
 	// Without SVRTV_LAYOUT the module behaves like Valve's with no headset:
 	// no device, never VR. (Reporting a device and forcing VR mode always made
 	// the client switch to VR at startup in 2D runs, and crash; see below.)
-	bool ShouldRunInVR() { return g_cfg.enabled && m_active; }
-	bool IsHmdConnected() { return g_cfg.enabled; }
+	bool ShouldRunInVR() { beat("ShouldRunInVR"); return g_cfg.enabled && m_active; }
+	bool IsHmdConnected() { beat("IsHmdConnected"); return g_cfg.enabled; }
 
 	void GetViewportBounds(VREye eye, int *x, int *y, int *w, int *h)
 	{
+		beat("GetViewportBounds");
 		// The left eye takes the first half: left in side-by-side, top in
 		// top-and-bottom, as HDMI 1.4 packs them.
 		// Any output may be NULL: the client's Activate() asks only for the
@@ -690,6 +699,7 @@ public:
 	// frame, screenshots included, and shows the eye if this did not.
 	bool DoDistortionProcessing(VREye eye)
 	{
+		beat("DoDistortionProcessing");
 		trace(0, "DoDistortionProcessing");
 		if (!g_cfg.latecopy)
 			show(eye);
@@ -707,6 +717,7 @@ public:
 	// different frames (2026-09-24); writing them together narrows that.
 	bool CompositeHud(VREye eye, float ndc[4], bool blackout, bool undistort, bool translucent)
 	{
+		beat("CompositeHud");
 		trace(1, "CompositeHud");
 		if (!g_cfg.latecopy)
 			return composite_eye(eye, ndc, translucent);
@@ -861,19 +872,41 @@ public:
 			write_angles();
 		QAngle a;
 		e->GetViewAngles(a);
-#ifdef _WIN32
-		// tier0's high-resolution clock; the log only uses differences.
 		AngleRow &r = g_ang[g_nang++];
-		r.t = Plat_FloatTime();
-#else
-		struct timeval tv;
-		gettimeofday(&tv, NULL);
-		AngleRow &r = g_ang[g_nang++];
-		r.t = tv.tv_sec + tv.tv_usec / 1e6;
-#endif
+		r.t = clock_s();
 		r.yaw = a[YAW];
 		r.pitch = a[PITCH];
 		r.frame = m_frame;
+	}
+
+	// Seconds, for logs that only use differences: tier0's high-resolution
+	// clock on Windows, gettimeofday elsewhere.
+	static double clock_s()
+	{
+#ifdef _WIN32
+		return Plat_FloatTime();
+#else
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		return tv.tv_sec + tv.tv_usec / 1e6;
+#endif
+	}
+	// SVRTV_CALLTRACE: each call the engine or client makes, at its start.
+	void beat(const char *what)
+	{
+		if (!g_cfg.calltrace)
+			return;
+		double t = clock_s();
+		IVEngineClient *e = engine();
+		bool loading = e && e->IsDrawingLoadingImage();
+		if (m_lastCall > 0 && t - m_lastCall > 0.2)
+			logf("call gap %.3f s: after %s, then %s (loading image: %d)\n", t - m_lastCall, m_lastWhat, what, (int)loading);
+		if (loading && t - m_lastLoadingLog > 1.0) {
+			m_lastLoadingLog = t;
+			logf("call while the loading image is drawn: %s\n", what);
+		}
+		m_lastCall = t;
+		m_lastWhat = what;
 	}
 
 	IVEngineClient *engine()
@@ -1554,6 +1587,7 @@ public:
 	// projection.
 	bool SampleTrackingState(float playerGameFov, float)
 	{
+		beat("SampleTrackingState");
 		// Called once per frame before the eyes render: a new frame.
 		m_frame++;
 		if (g_cfg.mouselog && (m_frame % 30) == 0)
@@ -1592,6 +1626,7 @@ public:
 
 	bool GetDisplayBounds(VRRect_t *r)
 	{
+		beat("GetDisplayBounds");
 		r->nX = 0;
 		r->nY = 0;
 		frame_size(&r->nWidth, &r->nHeight);
@@ -1600,6 +1635,7 @@ public:
 
 	bool GetEyeProjectionMatrix(VMatrix *out, VREye eye, float zNear, float zFar, float fovScale)
 	{
+		beat("GetEyeProjectionMatrix");
 		// Source's fov is defined for a 4:3 screen; widen it to the displayed
 		// aspect as the engine does for widescreen, then apply the zoom scale.
 		double t = tan(m_fovX * M_PI / 360.0) * (g_cfg.aspect / (4.0 / 3.0));
@@ -1631,6 +1667,7 @@ public:
 	// left, so the left eye moves +y and the right eye -y.
 	VMatrix GetMidEyeFromEye(VREye eye)
 	{
+		beat("GetMidEyeFromEye");
 		VMatrix m;
 		set_identity(m);
 		m.m[1][3] = (float)(eye_sign(eye) * g_cfg.separation / 2.0);
@@ -1752,6 +1789,7 @@ public:
 	}
 	ITexture *GetRenderTarget(VREye eye, EWhichRenderTarget which)
 	{
+		beat("GetRenderTarget");
 		trace(4, "GetRenderTarget");
 		ensure_targets();
 		// The client asks for the UI's render target right after setting the
@@ -1897,6 +1935,8 @@ private:
 
 	bool m_active;
 	bool m_clientCrosshair;   // the client places the crosshair (it asked for the display interface)
+	double m_lastCall, m_lastLoadingLog;   // SVRTV_CALLTRACE
+	const char *m_lastWhat;
 	float m_fovX;
 	IMaterialSystem *m_ms;
 	CreateInterfaceFn m_factory;
