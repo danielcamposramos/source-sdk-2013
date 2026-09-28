@@ -4,8 +4,10 @@
 //   Half-Life 2/hl2/custom/stereo3d-menu/gamepadui/options.res
 // The items bind the module's convars; none is "instantapply", so every
 // change waits for the Apply button, which reloads 3D once with all of them.
-// "vr_display_native" and "vr_display_gamescope" are set by the module at
-// start, so each path offers only what it can show.
+// One entry per setting: a hidden entry bound to the same convar wrote its
+// old value back over the visible one on Apply (run q25, native). The 3D
+// output wheel shows only inside gamescope (vr_display_gamescope, set by the
+// module at start); natively the output is always the 3D display.
 			"Stereo3D"
 			{
 				"text"			"Stereo 3D"
@@ -24,7 +26,6 @@
 				"text"			"3D format"
 				"type"			"wheelywheel"
 				"convar"		"vr_display_layout"
-				"depends_on"	"vr_display_native"
 
 				"options"
 				{
@@ -32,35 +33,6 @@
 					"3"		"Side by side, full"
 					"1"		"Top and bottom"
 					"0"		"Side by side"
-				}
-			}
-
-			"Stereo3DFormatGamescope"
-			{
-				"text"			"3D format"
-				"type"			"wheelywheel"
-				"convar"		"vr_display_layout"
-				"depends_on"	"vr_display_gamescope"
-
-				"options"
-				{
-					"2"		"Top and bottom, full (recommended)"
-					"3"		"Side by side, full"
-					"1"		"Top and bottom"
-					"0"		"Side by side"
-				}
-			}
-
-			"Stereo3DOutput"
-			{
-				"text"			"3D output"
-				"type"			"wheelywheel"
-				"convar"		"vr_display_output"
-				"depends_on"	"vr_display_native"
-
-				"options"
-				{
-					"0"		"3D display"
 				}
 			}
 
