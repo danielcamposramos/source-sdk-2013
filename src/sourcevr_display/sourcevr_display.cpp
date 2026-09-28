@@ -578,7 +578,7 @@ public:
 		m_hudMatUsed = NULL;
 		m_hudSheetUsed = NULL;
 		m_hudTranslucent = true;
-		m_engineShot = false;
+		m_engineShotPending = false;
 		m_steamLooked = false;
 		m_steamLib = NULL;
 		m_shotsApi = NULL;
@@ -923,7 +923,11 @@ public:
 		     on ? "taken (every screenshot in 3D is a stereo one)" : "handed back");
 	}
 	// Once a frame, after both eyes: a screenshot asked for by Steam's key,
-	// or by the engine's own (it is taking one now), then the finished ones.
+	// or by the engine's own, then the finished ones. The engine's own is
+	// followed, never joined: reading the eyes back during the engine's
+	// screenshot frame crashed the game four seconds later (run q35a; with the
+	// module's screenshots off, the same key did not, run q35c), so the module
+	// takes its pair on the first frame after the engine has finished.
 	void shot_frame()
 	{
 		if (g_cfg.shots) {
@@ -932,9 +936,12 @@ public:
 			int requests = g_shotRequests.exchange(0);
 			if (requests > 0 && m_shotsHooked)
 				shot_take(true);
-			else if (engineShot && !m_engineShot)
+			if (engineShot)
+				m_engineShotPending = true;
+			else if (m_engineShotPending) {
+				m_engineShotPending = false;
 				shot_take(false);
-			m_engineShot = engineShot;
+			}
 		}
 		shot_finish();
 	}
@@ -2648,7 +2655,7 @@ private:
 	IMaterial *m_hudMatUsed;    // this frame's HUD paste, repeated in a screenshot
 	ITexture *m_hudSheetUsed;
 	bool m_hudTranslucent;
-	bool m_engineShot;          // the engine was taking a screenshot last frame
+	bool m_engineShotPending;   // the engine took a screenshot: the module's pair follows once it is done
 	bool m_steamLooked;
 	void *m_steamLib;
 	ISteamScreenshots *m_shotsApi;
