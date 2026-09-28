@@ -63,13 +63,22 @@ Extract `gamepadui/options.res` from `hl2/hl2_pak_dir.vpk` with any VPK tool (th
 
 3D follows the menu's saved choice. `-stereo3d` starts in 3D whatever was saved (in the saved format); `-stereo3d tab` or `-stereo3d sbs` picks the format.
 
-Half-Life 2's muzzle flash sits off the gun in 3D (the 32-bit client rescales it for a 2D field of view). Until Valve ships the client fix, this puts it back:
+### The muzzle flash, cheats and achievements
+
+Half-Life 2's muzzle flash sits beside the gun in 3D (the 32-bit client rescales it for a 2D field of view). The fix is one setting, `viewmodel_fov 90`, which Half-Life 2 treats as a cheat:
 
 ```
 -vulkan -gamepadui +sv_cheats 1 +viewmodel_fov 90
 ```
 
-`sv_cheats 1` turns achievements off while it is set.
+- With cheats: the muzzle flash sits on the gun, and Steam achievements are off while `sv_cheats 1` is set.
+- Without cheats: achievements work, and the muzzle flash shows beside the gun. Everything else is the same.
+
+This lasts until Valve accepts this use as not cheating. The client fix in this branch (`c_baseviewmodel.cpp`, gated on the display module, `viewmodel_fov` still a cheat) does it for the games Valve builds from this SDK; for Half-Life 2 it needs Valve's build.
+
+### Can this be used to cheat?
+
+Yes, and we say so plainly. Stereo 3D needs a second camera: the engine draws the world twice, once from each eye, a few centimetres apart. A camera the game did not plan for is exactly what a cheat needs: moved further away, it could show what the player should not see from where they stand. This module keeps the eyes at a normal human distance (2.5 units, about 64 mm) and its source is here for anyone to check. In multiplayer the engine warns that an unsigned `sourcevr` module blocks secure (VAC) servers: this is for single player.
 
 ### 5. Play
 
@@ -90,13 +99,18 @@ DXVK_CONFIG_FILE="/path/to/Half-Life 2/dxvk.conf" SDL_VIDEODRIVER=x11 gamescope-
 
 The module installs its anaglyph effect into gamescope's ReShade folder when needed and switches it from the menu. On our machine (desktop on an AMD iGPU, game on the NVIDIA card) the game also needed `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only` and gamescope `--prefer-vk-device 10de:2504`; a single-GPU machine should not need them. Our exact working launch is [play.env.example](https://github.com/danielcamposramos/sony-bravia-linux/blob/main/tools/hl2-bench/play.env.example), read by our Steam wrapper [game-wrap.sh](https://github.com/danielcamposramos/sony-bravia-linux/blob/main/tools/hl2-bench/game-wrap.sh).
 
-### Windows (ported, not built yet)
+### Windows
 
-Valve's route: run `createallprojects.bat` in `src`, open the generated `everything.sln` in Visual Studio 2022 (the SDK's README lists the workload and Windows SDK), build the `sourcevr_display` project, and copy `sourcevr.dll` and `svrtv-anaglyph.fx` into the game's `bin` folder, keeping Valve's `sourcevr.dll` as `sourcevr.dll.valve`. Which Half-Life 2 binary folder takes it on Windows (32 or 64-bit) is still to be checked there. The menu section and the launch options are the same as on Linux; the gamescope section does not apply.
+Today's Half-Life 2 on Windows is 32-bit: Steam launches `hl2.exe` and lists no 64-bit Half-Life 2 (Half-Life 2: Deathmatch, by contrast, has `hl2mp_win64.exe`). So Half-Life 2 takes the 32-bit `sourcevr.dll` in its `bin` folder; a 64-bit Source engine takes the 64-bit one next to its own `engine.dll`.
+
+- Valve's route: run `createallprojects.bat` in `src`, open the generated `everything.sln` in Visual Studio 2022 (the SDK's README lists the workload and Windows SDK) and build the `sourcevr_display` project (the SDK builds 64-bit).
+- Our cross-build (2026-09-28): both architectures from Linux with clang-cl and lld-link against Microsoft's static CRT and Windows SDK, with the defines of Valve's `source_dll_win32_*.vpc`. Both load and pass the geometry test under Wine (four formats), with a stand-in `tier0.dll`: [the scripts](https://github.com/danielcamposramos/sony-bravia-linux/tree/main/tools/vr-stereo-spectator/sourcevr/windows).
+
+Install: keep Valve's `bin\sourcevr.dll` (if the game has one) as `sourcevr.dll.valve`, copy the module in, and put the menu file (step 3) at `hl2\custom\stereo3d-menu\gamepadui\options.res`. Launch options: as on Linux, without `-vulkan` (the game's own Direct3D 9). The anaglyph, rows and checkerboard outputs are gamescope's, so they are Linux only; on Windows the menu offers the display formats. The first run inside the game on Windows is being tested.
 
 ### Back to stock
 
-Stereo 3D: Disabled and Apply for 2D. To remove it: `mv "$HL2/bin/sourcevr.so.valve" "$HL2/bin/sourcevr.so"` and delete `hl2/custom/stereo3d-menu`.
+Stereo 3D: Disabled and Apply for 2D. To remove it, first turn Stereo 3D off in the game and quit (if the game quit in 3D, the module still holds your crosshair, motion blur and filtering values, in `svrtv-*` files next to it, to put back at the next start; Valve's module would not), then `mv "$HL2/bin/sourcevr.so.valve" "$HL2/bin/sourcevr.so"` and delete `hl2/custom/stereo3d-menu`.
 
 ### Troubleshooting
 
