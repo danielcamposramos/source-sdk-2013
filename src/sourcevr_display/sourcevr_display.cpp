@@ -474,7 +474,6 @@ public:
 		m_warp = NULL;
 		m_triedMouseRect = false;
 		m_confined = NULL;
-		m_gsScreenW = m_gsScreenH = 0;
 		m_getState = NULL;
 		m_getFocus = NULL;
 		m_getSize = NULL;
@@ -491,8 +490,6 @@ public:
 		m_effectSet = false;
 		m_xTried = false;
 		m_xdpy = NULL;
-		m_xDefaultScreen = NULL;
-		m_xDisplayWidth = m_xDisplayHeight = NULL;
 		m_uiMade = false;
 		m_nTargets = 0;
 	}
@@ -953,8 +950,6 @@ public:
 	typedef int (*XChangePropertyFn)(void *, unsigned long, unsigned long, unsigned long, int, int, const unsigned char *, int);
 	typedef int (*XDeletePropertyFn)(void *, unsigned long, unsigned long);
 	typedef int (*XFlushFn)(void *);
-	typedef int (*XDefaultScreenFn)(void *);
-	typedef int (*XDisplaySizeFn)(void *, int);
 	bool in_gamescope() { return getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL; }
 	bool x11()
 	{
@@ -974,9 +969,6 @@ public:
 		m_xChange = (XChangePropertyFn)dlsym(lib, "XChangeProperty");
 		m_xDelete = (XDeletePropertyFn)dlsym(lib, "XDeleteProperty");
 		m_xFlush = (XFlushFn)dlsym(lib, "XFlush");
-		m_xDefaultScreen = (XDefaultScreenFn)dlsym(lib, "XDefaultScreen");
-		m_xDisplayWidth = (XDisplaySizeFn)dlsym(lib, "XDisplayWidth");
-		m_xDisplayHeight = (XDisplaySizeFn)dlsym(lib, "XDisplayHeight");
 		if (!open || !m_xInternAtom || !m_xRoot || !m_xChange || !m_xDelete || !m_xFlush)
 			return false;
 		m_xdpy = open(NULL);
@@ -1036,17 +1028,6 @@ public:
 		m_xFlush(m_xdpy);
 		m_effectSet = technique >= 0;
 		logf("output: gamescope effect %s (technique %d)\n", technique < 0 ? "off" : "svrtv-anaglyph.fx", technique);
-	}
-	// Inside gamescope, which formats its nested screen can hold.
-	void publish_gamescope_screen()
-	{
-		if (!g_pCVar || !in_gamescope() || !x11() || !m_xDefaultScreen || !m_xDisplayWidth || !m_xDisplayHeight)
-			return;
-		int screen = m_xDefaultScreen(m_xdpy);
-		int sw = m_xDisplayWidth(m_xdpy, screen), sh = m_xDisplayHeight(m_xdpy, screen);
-		m_gsScreenW = sw;
-		m_gsScreenH = sh;
-		logf("gamescope screen at start: %dx%d\n", sw, sh);
 	}
 	void apply_output()
 	{
@@ -1764,7 +1745,6 @@ public:
 		// the first call, at startup: the client asks again from its own
 		// Activate(), after the module has marked 3D on (run q05).
 		if (!m_startupDone) {
-			publish_gamescope_screen();
 			launch_3d_unmark();
 			if (g_pCVar) {
 				g_cfg.output = vr_display_output.GetInt();
@@ -1858,9 +1838,6 @@ private:
 	XChangePropertyFn m_xChange;
 	XDeletePropertyFn m_xDelete;
 	XFlushFn m_xFlush;
-	XDefaultScreenFn m_xDefaultScreen;
-	XDisplaySizeFn m_xDisplayWidth;
-	XDisplaySizeFn m_xDisplayHeight;
 	int m_modeCheckFrame;       // the frame at which to log whether the frame mode was granted (0: none)
 	int m_relayout;             // Apply while on: the format + 1 to activate again with, in Deactivate()
 	ITexture *m_rt[2];
@@ -1883,7 +1860,6 @@ private:
 	SdlWarp m_warp;
 	bool m_triedMouseRect;
 	void *m_confined;
-	int m_gsScreenW, m_gsScreenH;   // gamescope's nested screen (0: not in gamescope)
 	SdlGetMouseState m_getState;
 	SdlGetFocus m_getFocus;
 	SdlGetWindowSize m_getSize;
