@@ -120,14 +120,19 @@ int format_from_name(const char *name)
 }
 
 // 3D outputs: what the screen needs. The ones past OUT_DISPLAY combine the
-// eyes pixel by pixel, which gamescope's effect does.
-enum Output { OUT_DISPLAY = 0, OUT_ANAGLYPH_CRT, OUT_ANAGLYPH_MODERN, OUT_ROWS, OUT_CHECKERBOARD, OUT_COUNT };
+// eyes pixel by pixel, which gamescope's effect does. OUT_SYSTEM hands both
+// eyes to the system (KWin with the driver_stereodisplay package), which
+// sends them to the screen's 3D mode or mixes them as anaglyph: the frame is
+// two full 2D-size eyes side by side, packed for nothing (Daniel, 2026-10-01:
+// games are side by side, as VR is).
+enum Output { OUT_DISPLAY = 0, OUT_ANAGLYPH_CRT, OUT_ANAGLYPH_MODERN, OUT_ROWS, OUT_CHECKERBOARD, OUT_SYSTEM, OUT_COUNT };
 
 struct Config {
 	bool enabled;   // 3D requested (SVRTV_LAYOUT set); otherwise fully inert
 	bool layoutGiven; // the format came with the request (SVRTV_LAYOUT, -stereo3d <format>)
 	int format;       // Format
 	int output;       // Output
+	int outputForced; // SVRTV_OUTPUT: the output for this run, never saved (-1: the saved one)
 	bool sizeGiven;   // SVRTV_WIDTH/HEIGHT set; otherwise the 2D size is the video mode's
 	int width, height;
 	double aspect;
@@ -371,6 +376,16 @@ void load_config()
 		g_cfg.layoutGiven = true;
 	}
 	g_cfg.output = OUT_DISPLAY;
+	// The bench's output for one run (SVRTV_OUTPUT=system or a number): the
+	// menu's saved output is left as the player set it.
+	const char *output = setting("SVRTV_OUTPUT");
+	g_cfg.outputForced = -1;
+	if (output && !strcmp(output, "system"))
+		g_cfg.outputForced = OUT_SYSTEM;
+	else if (output && *output >= '0' && *output <= '9' && atoi(output) < OUT_COUNT)
+		g_cfg.outputForced = atoi(output);
+	if (g_cfg.outputForced >= 0)
+		g_cfg.output = g_cfg.outputForced;
 	// The launch option, e.g. Steam's "3D SBS Vulkan": -vulkan -stereo3d, in
 	// the saved format (read at startup); -stereo3d <format> forces one
 	// (sbs, tab, tabfull, sbsfull, fp1080, fp720).
@@ -504,7 +519,7 @@ static ConVar vr_display_layout("vr_display_layout", "2", FCVAR_ARCHIVE,
 	"3D format: 2 top and bottom full (recommended: full-size eyes, supersampled), 3 side by side full, 1 top and bottom, 0 side by side (lighter), 4 frame packing 1080p, 5 frame packing 720p",
 	true, 0, true, FMT_COUNT - 1, display_changed);
 static ConVar vr_display_output("vr_display_output", "0", FCVAR_ARCHIVE,
-	"3D output: 0 the 3D display, 1 red/cyan anaglyph for CRTs, 2 red/cyan anaglyph for modern screens, 3 row-interleaved (passive screens), 4 checkerboard (DLP)",
+	"3D output: 0 the 3D display, 1 red/cyan anaglyph for CRTs, 2 red/cyan anaglyph for modern screens, 3 row-interleaved (passive screens), 4 checkerboard (DLP), 5 the system (both eyes at full size; the desktop sends them to the screen)",
 	true, 0, true, OUT_COUNT - 1, display_changed);
 static ConVar vr_display_swap("vr_display_swap", "0", FCVAR_ARCHIVE,
 	"Swap the eyes: 0 left eye first, 1 right eye first",
@@ -746,6 +761,8 @@ public:
 	// needs the HDMI 3D signal, travels as full top and bottom there.
 	int packing()
 	{
+		if (g_cfg.output == OUT_SYSTEM)
+			return FMT_SBS;
 		if (g_cfg.output != OUT_DISPLAY && (g_cfg.format == FMT_FP1080 || g_cfg.format == FMT_FP720))
 			return FMT_TAB;
 		// The frame is always the screen the game already has: the full
@@ -763,15 +780,21 @@ public:
 	bool full_eyes()
 	{
 		int f = g_cfg.format;
-		return f == FMT_TAB_FULL || f == FMT_SBS_FULL
+		return g_cfg.output == OUT_SYSTEM || f == FMT_TAB_FULL || f == FMT_SBS_FULL
 			|| (g_cfg.output != OUT_DISPLAY && (f == FMT_FP1080 || f == FMT_FP720));
 	}
 	bool packed_tab() { return packing() == FMT_TAB; }
 
-	// The output frame's size.
+	// The output frame's size: the screen the game has. For the system it
+	// holds two 2D-size eyes side by side; the game starts at that size.
 	void frame_size(int *w, int *h)
 	{
 		int W = g_cfg.width, H = g_cfg.height;
+		if (g_cfg.output == OUT_SYSTEM) {
+			*w = 2 * W;
+			*h = H;
+			return;
+		}
 		switch (packing()) {
 		case FMT_FP1080: *w = 1920; *h = 2205; break;
 		case FMT_FP720: *w = 1280; *h = 1470; break;
@@ -785,7 +808,9 @@ public:
 	void half(VREye eye, int *x, int *y, int *w, int *h)
 	{
 		bool first = (eye == VREye_Left) != g_cfg.swap;
-		int W = g_cfg.width, H = g_cfg.height;
+		// the halves of the frame (the 2D size, or two of it for the system)
+		int W, H;
+		frame_size(&W, &H);
 		int vx = 0, vy = 0, vw = W, vh = H;
 		switch (packing()) {
 		case FMT_SBS: vw = W / 2; vx = first ? 0 : W / 2; break;
@@ -1824,11 +1849,11 @@ public:
 	{
 		int out = g_cfg.output;
 		if (!in_gamescope()) {
-			if (out != OUT_DISPLAY)
+			if (out != OUT_DISPLAY && out != OUT_SYSTEM)
 				command("echo \"3D output: this output needs gamescope; showing the 3D display format instead\"");
 			return;
 		}
-		if (out == 0 && !g_cfg.loading) {
+		if ((out == OUT_DISPLAY || out == OUT_SYSTEM) && !g_cfg.loading) {
 			if (m_effectSet)
 				gamescope_effect(-1);
 			return;
@@ -1836,8 +1861,8 @@ public:
 		// svrtv-anaglyph.fx techniques, from side by side / from top and bottom.
 		// The full formats pack into the same screen, so they use the same ones.
 		// The 3D display itself gets 10/9: the frames as they are, loading
-		// screens whole in both halves (mark_frame).
-		static const int techniques[OUT_COUNT][2] = { { 10, 9 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 } };
+		// screens whole in both halves (mark_frame); the system the same.
+		static const int techniques[OUT_COUNT][2] = { { 10, 9 }, { 0, 3 }, { 1, 4 }, { 6, 5 }, { 7, 8 }, { 10, 9 } };
 		gamescope_effect(techniques[out][packed_tab() ? 1 : 0]);
 	}
 	void clear_output()
@@ -1888,7 +1913,8 @@ public:
 		int w, h, win;
 		bool windowed;
 		if (saved_mode(&w, &h, &win) || mode_now(&w, &h, &windowed)) {
-			g_cfg.width = w;
+			// for the system the video mode holds two 2D-size eyes side by side
+			g_cfg.width = g_cfg.output == OUT_SYSTEM ? w / 2 : w;
 			g_cfg.height = h;
 		}
 	}
@@ -2551,7 +2577,7 @@ public:
 		if (!m_startupDone) {
 			launch_3d_unmark();
 			if (g_pCVar) {
-				g_cfg.output = vr_display_output.GetInt();
+				g_cfg.output = g_cfg.outputForced >= 0 ? g_cfg.outputForced : vr_display_output.GetInt();
 				g_cfg.swap = vr_display_swap.GetBool();
 			}
 		}
@@ -2595,7 +2621,7 @@ public:
 		launch_3d_forget();
 		bool on = vr_display_3d.GetInt() > 0;
 		int format = vr_display_layout.GetInt();
-		g_cfg.output = vr_display_output.GetInt();
+		g_cfg.output = g_cfg.outputForced >= 0 ? g_cfg.outputForced : vr_display_output.GetInt();
 		g_cfg.swap = vr_display_swap.GetBool();
 		if (g_cfg.enabled && m_active) {
 			// Deactivate() below activates again with the new settings, or ends
