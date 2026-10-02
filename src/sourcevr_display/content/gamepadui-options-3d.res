@@ -51,6 +51,9 @@
 				"options"
 				{
 					"2"		"1920x1080 (recommended for 3D TVs)"
+					"3"		"2560x1440 (sharper)"
+					"4"		"3200x1800"
+					"5"		"3840x2160 (sharpest)"
 					"1"		"1600x900"
 					"0"		"1280x720 (faster)"
 				}

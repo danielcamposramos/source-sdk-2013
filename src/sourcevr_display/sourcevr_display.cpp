@@ -544,8 +544,8 @@ static ConVar vr_display_packs("vr_display_packs", "1", FCVAR_DONTRECORD,
 // is sharper (supersampled) and below it is faster. The game's screen is set
 // at start, so it applies at the next start (the launch reads it).
 static ConVar vr_display_render("vr_display_render", "2", FCVAR_ARCHIVE,
-	"Render resolution per eye, system output (next start): 0 1280x720, 1 1600x900, 2 1920x1080 (3D TVs)",
-	true, 0, true, 2);
+	"Render resolution per eye, system output (next start): 0 1280x720, 1 1600x900, 2 1920x1080 (3D TVs), 3 2560x1440, 4 3200x1800, 5 3840x2160",
+	true, 0, true, 5);
 
 
 // Stereo screenshots (Daniel, 2026-09-28). While 3D is on the module takes
