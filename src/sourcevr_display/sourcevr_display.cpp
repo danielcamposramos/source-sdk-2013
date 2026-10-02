@@ -880,7 +880,7 @@ public:
 	// into both halves, and paints the mark over.
 	void mark_frame()
 	{
-		if (!g_cfg.loading || !in_gamescope() || !m_ms)
+		if (!g_cfg.loading || !in_gamescope() || !m_ms || g_cfg.output == OUT_SYSTEM)
 			return;
 		int fw, fh;
 		frame_size(&fw, &fh);
@@ -1853,7 +1853,9 @@ public:
 				command("echo \"3D output: this output needs gamescope; showing the 3D display format instead\"");
 			return;
 		}
-		if ((out == OUT_DISPLAY || out == OUT_SYSTEM) && !g_cfg.loading) {
+		// The system draws the eyes itself: gamescope's effect has nothing to do
+		// (and its ReShade aborted gamescope on the 3840x1080 frame, run sysb 5a).
+		if ((out == OUT_DISPLAY && !g_cfg.loading) || out == OUT_SYSTEM) {
 			if (m_effectSet)
 				gamescope_effect(-1);
 			return;
