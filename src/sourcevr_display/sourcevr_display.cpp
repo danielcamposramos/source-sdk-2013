@@ -2114,6 +2114,11 @@ public:
 		// (runs q15/q16, and again q20). Established solution.
 		if (in_gamescope())
 			return false;
+		// The system keeps the pointer on the left eye itself (KWin maps it
+		// there); the fence held it in the window, so no other window could be
+		// reached (run sysb native, 2026-10-01).
+		if (g_cfg.output == OUT_SYSTEM)
+			return false;
 		int fw, fh;
 		frame_size(&fw, &fh);
 		int W = g_cfg.width, H = g_cfg.height;
@@ -2528,7 +2533,7 @@ public:
 			return false;
 		m_active = true;
 		size_from_mode();
-		logf("activated: %s, %dx%d 2D\n", g_formatNames[g_cfg.format], g_cfg.width, g_cfg.height);
+		logf("activated: %s, %dx%d 2D\n", g_cfg.output == OUT_SYSTEM ? "system (side by side, full)" : g_formatNames[g_cfg.format], g_cfg.width, g_cfg.height);
 		command(g_cfg.onvr);
 		if (g_cfg.xhair && !m_clientCrosshair)
 			crosshair_off();
