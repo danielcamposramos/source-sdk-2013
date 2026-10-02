@@ -530,6 +530,22 @@ static ConVar vr_display_gamescope("vr_display_gamescope", "0", FCVAR_DONTRECORD
 	"1 when the game runs inside gamescope (set by the VR module)");
 static ConVar vr_display_native("vr_display_native", "1", FCVAR_DONTRECORD,
 	"1 when the game runs outside gamescope (set by the VR module)");
+// The system output (version B: the desktop shows the eyes in its own 3D
+// mode) has its own menu: stereo on or off, the render resolution and the
+// eye order; the 3D format and output are the desktop's (Daniel, 2026-10-02).
+// The menu shows an entry only when a convar is true, so the module sets one
+// for each family. Not saved.
+static ConVar vr_display_system("vr_display_system", "0", FCVAR_DONTRECORD,
+	"1 when the system draws the eyes (set by the VR module)");
+static ConVar vr_display_packs("vr_display_packs", "1", FCVAR_DONTRECORD,
+	"1 when the game packs the 3D format itself (set by the VR module)");
+// The render resolution per eye for the system output: the frame holds two
+// side by side and the desktop scales it to its 3D mode, so above the output
+// is sharper (supersampled) and below it is faster. The game's screen is set
+// at start, so it applies at the next start (the launch reads it).
+static ConVar vr_display_render("vr_display_render", "2", FCVAR_ARCHIVE,
+	"Render resolution per eye, system output (next start): 0 1280x720, 1 1600x900, 2 1920x1080 (3D TVs)",
+	true, 0, true, 2);
 
 
 // Stereo screenshots (Daniel, 2026-09-28). While 3D is on the module takes
@@ -646,6 +662,17 @@ public:
 		m_loadingDirty = false;
 	}
 
+	// The menu's families: the system's entries, or the game's own formats
+	// and, inside gamescope, its outputs.
+	void menu_flags()
+	{
+		bool system = g_cfg.output == OUT_SYSTEM;
+		bool gamescope = getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL;
+		vr_display_system.SetValue(system ? 1 : 0);
+		vr_display_packs.SetValue(system ? 0 : 1);
+		vr_display_gamescope.SetValue(gamescope && !system ? 1 : 0);
+	}
+
 	// IAppSystem
 	// The engine connects the module like any app system; its factory
 	// reaches the material system, which the render targets need.
@@ -656,8 +683,8 @@ public:
 		ConnectTier1Libraries(&factory, 1);
 		ConVar_Register(0);
 		bool gamescope = getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL;
-		vr_display_gamescope.SetValue(gamescope ? 1 : 0);
 		vr_display_native.SetValue(gamescope ? 0 : 1);
+		menu_flags();
 		// Loading screens: the files GameUI reads once, at start-up, set now
 		// for the state the game starts in; the source materials (re)written.
 		if (g_cfg.loading && loading_available()) {
@@ -2586,6 +2613,7 @@ public:
 			if (g_pCVar) {
 				g_cfg.output = g_cfg.outputForced >= 0 ? g_cfg.outputForced : vr_display_output.GetInt();
 				g_cfg.swap = vr_display_swap.GetBool();
+				menu_flags();
 			}
 		}
 		if (!g_cfg.enabled && vr_display_3d.GetInt() > 0) {
@@ -2630,6 +2658,7 @@ public:
 		int format = vr_display_layout.GetInt();
 		g_cfg.output = g_cfg.outputForced >= 0 ? g_cfg.outputForced : vr_display_output.GetInt();
 		g_cfg.swap = vr_display_swap.GetBool();
+		menu_flags();
 		if (g_cfg.enabled && m_active) {
 			// Deactivate() below activates again with the new settings, or ends
 			// 3D; the client's Deactivate() first asks ShouldRunInVR(), so 3D

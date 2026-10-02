@@ -8,6 +8,10 @@
 // old value back over the visible one on Apply (run q25, native). The 3D
 // output wheel shows only inside gamescope (vr_display_gamescope, set by the
 // module at start); natively the output is always the 3D display.
+// When the system draws the eyes (vr_display_system: the desktop shows them in
+// its own 3D mode), the format and the output are the desktop's, so the menu
+// shows the render resolution per eye instead (applied at the next start).
+// Swap eyes shows in every case (Daniel, 2026-10-02).
 			"Stereo3D"
 			{
 				"text"			"Stereo 3D"
@@ -26,6 +30,7 @@
 				"text"			"3D format"
 				"type"			"wheelywheel"
 				"convar"		"vr_display_layout"
+				"depends_on"	"vr_display_packs"
 
 				"options"
 				{
@@ -33,6 +38,21 @@
 					"3"		"Side by side, full"
 					"1"		"Top and bottom"
 					"0"		"Side by side"
+				}
+			}
+
+			"Stereo3DRender"
+			{
+				"text"			"Render resolution per eye (next start)"
+				"type"			"wheelywheel"
+				"convar"		"vr_display_render"
+				"depends_on"	"vr_display_system"
+
+				"options"
+				{
+					"2"		"1920x1080 (recommended for 3D TVs)"
+					"1"		"1600x900"
+					"0"		"1280x720 (faster)"
 				}
 			}
 
